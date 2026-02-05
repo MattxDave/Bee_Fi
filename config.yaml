@@ -1,0 +1,19 @@
+# Bee Swarm RL Configuration
+# This config matches the trained model parameters
+
+env:
+  num_bees: 5
+  num_flowers: 12
+  grid_size: 30
+  max_steps: 800
+  harvest_radius: 35.0  # Increased for 3D orbital motion
+  reach_margin: 2.0
+  lambda_z: 0.5
+  orbit_scale: 0.8
+  battery_min_steps: 300
+  battery_max_steps: 500
+  recharge_time: 30
+  retask_board_size: 2  # Must match trained model!
+
+output:
+  path: outputs
