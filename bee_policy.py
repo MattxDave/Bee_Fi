@@ -13,6 +13,7 @@ class Actor(nn.Module):
         hidden_dim=256,
         num_flowers: int = 12,
         retask_board_size: int = 0,
+        grid_size: int = 50,
     ):
         super().__init__()
         self.num_bees = num_bees
@@ -20,6 +21,7 @@ class Actor(nn.Module):
         self.num_flowers = int(num_flowers)
         self.hidden_dim = hidden_dim
         self.retask_board_size = int(retask_board_size)
+        self.grid_size = float(grid_size)
 
         # --- Feature Encoders ---
         self.position_fc = nn.Sequential(nn.Linear(3, 64), nn.LayerNorm(64), nn.ReLU())
@@ -98,7 +100,7 @@ class Actor(nn.Module):
             return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Normalize inputs for stability
-        position = ensure2d(obs_dict["position"]) / 30.0  # grid size normalization
+        position = ensure2d(obs_dict["position"]) / self.grid_size  # grid size normalization
         status = ensure2d(obs_dict["status"])
 
         # --- NEW: Flower Attention Logic ---
@@ -115,8 +117,8 @@ class Actor(nn.Module):
             raise e
 
         # 2. Normalize features
-        flowers_reshaped[:, :, 0] /= 30.0  # x coord (grid size)
-        flowers_reshaped[:, :, 1] /= 30.0  # y coord (grid size)
+        flowers_reshaped[:, :, 0] /= self.grid_size  # x coord (grid size)
+        flowers_reshaped[:, :, 1] /= self.grid_size  # y coord (grid size)
         flowers_reshaped[:, :, 2] /= 10.0  # pollen (normalized by capacity)
         # features 3-7 are 0/1 flags (harvested, mine, busy, reachable, fits)
         # feature 8: dist_norm - already normalized by harvest_radius in env
@@ -198,12 +200,13 @@ class Actor(nn.Module):
 
 class CentralizedCritic(nn.Module):
     def __init__(
-        self, global_state_size: int, num_bees: int, action_dim: int = 3, hidden_dim: int = 512
+        self, global_state_size: int, num_bees: int, action_dim: int = 3, hidden_dim: int = 512, grid_size: int = 50,
     ):
         super().__init__()
         self.global_state_size = int(global_state_size)
         self.num_bees = int(num_bees)
         self.action_dim = int(action_dim)
+        self.grid_size = float(grid_size)
         # This part of the critic is not used in your PPO, but we leave it
         self.joint_action_dim = self.num_bees * self.action_dim
         self.hidden_dim = hidden_dim
@@ -247,7 +250,7 @@ class CentralizedCritic(nn.Module):
             state = state.unsqueeze(0)
 
         # Normalize state
-        state_norm = state / 30.0  # grid size normalization
+        state_norm = state / self.grid_size  # grid size normalization
 
         # Your PPO logic does not pass joint_action, so we only use state
         x = torch.nan_to_num(state_norm, nan=0.0, posinf=0.0, neginf=0.0)

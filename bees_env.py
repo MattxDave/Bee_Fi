@@ -79,7 +79,7 @@ class BeeForagingEnv(ParallelEnv):
         max_steps=800,
         time_window_min=10,
         time_window_max=80,
-        harvest_radius=35.0,  # Increased to cover orbital motion range
+        harvest_radius=18.0,  # Euclidean distance from current bee position to flower
         lambda_z=0.1,
         knn_k=3,
         orbit_scale=1.2,
@@ -105,6 +105,7 @@ class BeeForagingEnv(ParallelEnv):
         recharge_steps: int = 30,
         drain_per_step: float = 1.0,
         drain_per_unit: float = 0.0,
+        low_battery_chance: float = 0.05,  # Probability of low-battery training episode
         # ---------- Logging ----------
         verbose: bool = True,
     ):
@@ -148,6 +149,7 @@ class BeeForagingEnv(ParallelEnv):
         self.recharge_steps = int(recharge_steps)
         self.drain_per_step = float(drain_per_step)
         self.drain_per_unit = float(drain_per_unit)
+        self.low_battery_chance = float(low_battery_chance)
 
         # Track if this is a low-battery training episode
         self._is_low_battery_episode = False
@@ -194,6 +196,11 @@ class BeeForagingEnv(ParallelEnv):
         # For orbit-change checks
         self.last_effective_inclination = [0.0] * self.num_bees
         self.last_effective_yaw = [0.0] * self.num_bees
+
+        # HRL: Current goals for each bee (set by manager policy)
+        # Goals: 0=IDLE, 1=HARVEST, 2=GROOM, 3=ASSIST
+        self._current_goals = np.zeros(self.num_bees, dtype=int)
+        self._goal_set_step = np.zeros(self.num_bees, dtype=int)  # Step when goal was set
 
     # ----------------------------------------------------------
     # Reset
@@ -281,8 +288,8 @@ class BeeForagingEnv(ParallelEnv):
         # Battery init with random low-battery episodes for retasking learning
         rng = np.random.default_rng()
 
-        # 30% chance of "low battery episode" to force retasking scenarios
-        if rng.random() < 0.3:
+        # Configurable chance of "low battery episode" to force retasking scenarios
+        if rng.random() < self.low_battery_chance:
             # Low battery episode: batteries will die mid-episode, forcing task reassignment
             self._is_low_battery_episode = True
             battery_min = max(50, self.battery_min_steps // 3)  # Much shorter battery
@@ -320,6 +327,10 @@ class BeeForagingEnv(ParallelEnv):
 
         # Debug reachability (optional - comment out for production)
         # self.debug_reachability()
+
+        # HRL: Reset goals to IDLE (0) for all bees
+        self._current_goals = np.zeros(self.num_bees, dtype=int)
+        self._goal_set_step = np.zeros(self.num_bees, dtype=int)
 
         # Initialize retask board for the start of an episode
         try:
@@ -565,16 +576,18 @@ class BeeForagingEnv(ParallelEnv):
                     self.flowers[fj].assigned_bee = i
                     bee.assigned_flowers.append(fj)
                     bee.truncated = False  # Resume working
-                    print(
-                        f"[RESUME] Bee {i} picked up flower {fj} from queue - no longer truncated"
-                    )
+                    if self.verbose:
+                        print(
+                            f"[RESUME] Bee {i} picked up flower {fj} from queue - no longer truncated"
+                        )
                 else:
                     # No tasks available - force DONOTHING
                     actions[f"bee_{i}"] = 0
 
         # VFRL heartbeat update - REWARD DONOTHING WHEN APPROPRIATE
         for i in range(self.num_bees):
-            a = int(actions.get(f"bee_{i}", 0))
+            agent_id = f"bee_{i}"
+            a = int(actions.get(agent_id, 0))
             if a in (1, 2):  # HARVEST or GROOM
                 self._last_broadcast_step[i] = self.steps
                 self._idle_steps[i] = 0
@@ -590,6 +603,45 @@ class BeeForagingEnv(ParallelEnv):
                 # Reason 1: If bee is at/near capacity it MUST groom, so DONOTHING is bad
                 if bee.load >= bee.capacity * 0.95:  # At 95% capacity
                     should_do_nothing = False
+
+                # Check if a valid harvest exists right now for this bee
+                has_harvest_now = False
+                fx, fy, fz = bee.fx, bee.fy, bee.fz
+                for fj, f in enumerate(self.flowers):
+                    if f.harvested:
+                        continue
+                    if f.assigned_bee is not None and f.assigned_bee != i:
+                        continue
+                    reachable = bool(
+                        hasattr(self, "reachable")
+                        and self.reachable.shape == (self.num_bees, self.num_flowers)
+                        and self.reachable[i, fj]
+                    )
+                    if not reachable:
+                        continue
+                    cx, cy = f.center_xy
+                    dx, dy, dz = fx - cx, fy - cy, fz
+                    d = math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
+                    in_range = d <= self.harvest_radius
+                    in_time_window = f.is_harvestable_at_time(self.steps)
+                    fits = (bee.load + f.pollen) <= bee.capacity + 1e-9
+                    if in_range and in_time_window and fits:
+                        has_harvest_now = True
+                        break
+
+                battery_ratio = (
+                    self._battery[i] / self._battery_max[i]
+                    if self._battery_max[i] > 0
+                    else 1.0
+                )
+                needs_groom = (bee.load >= bee.capacity * 0.8) or (battery_ratio <= 0.3)
+
+                if needs_groom or not should_do_nothing:
+                    rewards[agent_id] -= 0.1
+                elif has_harvest_now:
+                    rewards[agent_id] -= 0.05
+                else:
+                    rewards[agent_id] += 0.05
 
         # Claim resolution: process retask board claims and assign flower to winner
         if claims:
@@ -638,7 +690,8 @@ class BeeForagingEnv(ParallelEnv):
             if self._recharge_until[i] > self.steps:
                 rewards[agent] -= 0.1  # Small penalty for trying to groom while recharging
                 if self.verbose:
-                    print(f"[ENV] Bee {i} tried to groom while already recharging")
+                    if self.verbose:
+                        print(f"[ENV] Bee {i} tried to groom while already recharging")
                 continue
 
             # Priority: Battery recharge takes precedence over pollen offload
@@ -717,14 +770,13 @@ class BeeForagingEnv(ParallelEnv):
 
                         cx, cy = f.center_xy
                         dx, dy, dz = fx - cx, fy - cy, fz
+                        # Use Euclidean distance from current position
                         d = math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
                         if d <= self.harvest_radius:
-                            current_d = self._min_distance_to_orbit(bee, cx, cy)
-                            if current_d <= (self.harvest_radius + self.reach_margin):
-                                in_range_any = True
-                                if (bee.load + f.pollen) <= bee.capacity + 1e-9:
-                                    if d < best_d:
-                                        best, best_d = j, d
+                            in_range_any = True
+                            if (bee.load + f.pollen) <= bee.capacity + 1e-9:
+                                if d < best_d:
+                                    best, best_d = j, d
 
                     if best is not None:
                         intents[i] = (best, best_d)
@@ -830,7 +882,13 @@ class BeeForagingEnv(ParallelEnv):
                         # Broadcast to nearest bee with full task metadata
                         tasks_broadcast = 0
                         if nearest_bee_id is not None:
+                            target_bee = self.bees[nearest_bee_id]
+                            # Get existing flower IDs in target's retask_board to avoid duplicates
+                            existing_in_board = {t["flower_id"] for t in target_bee.retask_board}
                             for fj in bee.assigned_flowers:
+                                # Skip if already in target's board or already harvested
+                                if fj in existing_in_board:
+                                    continue
                                 if fj < len(self.flowers) and not self.flowers[fj].harvested:
                                     f = self.flowers[fj]
                                     task = {
@@ -847,7 +905,8 @@ class BeeForagingEnv(ParallelEnv):
                                         "x": f.x,
                                         "y": f.y,
                                     }
-                                    self.bees[nearest_bee_id].retask_board.append(task)
+                                    target_bee.retask_board.append(task)
+                                    existing_in_board.add(fj)  # Track to avoid duplicates
                                     tasks_broadcast += 1
                             
                             self.bees[nearest_bee_id].last_received_from = i
@@ -919,14 +978,18 @@ class BeeForagingEnv(ParallelEnv):
                 # Verify this bee actually won the flower and it's in range
                 if f.busy_by == i:
                     cx, cy = f.center_xy
-                    current_d = self._min_distance_to_orbit(bee, cx, cy)
+                    # Use Euclidean distance from current position (not orbit-min)
+                    dx = bee.fx - cx
+                    dy = bee.fy - cy
+                    dz = bee.fz
+                    current_d = math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
 
                     # NEW: Check time window before allowing harvest
                     in_time_window = f.is_harvestable_at_time(self.steps)
 
-                    # Double-check it's actually reachable and in time window
+                    # Double-check it's actually in range (Euclidean) and in time window
                     if (
-                        current_d <= (self.harvest_radius + self.reach_margin)
+                        current_d <= self.harvest_radius
                         and not f.harvested
                         and in_time_window
                     ):
@@ -946,7 +1009,8 @@ class BeeForagingEnv(ParallelEnv):
                             f.assigned_bee = i
                             if fj not in bee.assigned_flowers:
                                 bee.assigned_flowers.append(fj)
-                            print(f"[POOL] Bee {i} claimed unassigned flower {fj} from pool")
+                            if self.verbose:
+                                print(f"[POOL] Bee {i} claimed unassigned flower {fj} from pool")
 
                         # BALANCED REWARD: proportional to pollen with efficiency bonuses
                         base_reward = f.pollen * 0.5
@@ -964,15 +1028,17 @@ class BeeForagingEnv(ParallelEnv):
 
                         rewards[agent] += total_reward
                         success_map[agent] = True
-                        print(
-                            f"[ENV] Bee {i} harvested flower {fj} (+{actual_gain:.1f}pollen, reward: {total_reward:.1f}, now {bee.load:.1f}/{bee.capacity:.1f})"
-                        )
+                        if self.verbose:
+                            print(
+                                f"[ENV] Bee {i} harvested flower {fj} (+{actual_gain:.1f}pollen, reward: {total_reward:.1f}, now {bee.load:.1f}/{bee.capacity:.1f})"
+                            )
                     elif not in_time_window:
                         # NEW: Attempted harvest outside time window
                         rewards[agent] -= 2.0
-                        print(
-                            f"[ENV] Bee {i} MISSED TIME WINDOW for flower {fj} (type: {f.window_type})"
-                        )
+                        if self.verbose:
+                            print(
+                                f"[ENV] Bee {i} MISSED TIME WINDOW for flower {fj} (type: {f.window_type})"
+                            )
                         # Mark HARD window as permanently missed
                         if f.window_type == "HARD":
                             f.window_missed = True
@@ -980,18 +1046,21 @@ class BeeForagingEnv(ParallelEnv):
                     else:
                         # Too far or already harvested - simple fixed penalty
                         rewards[agent] -= 0.5
-                        print(
-                            f"[ENV] Bee {i} failed harvest - distance {current_d:.2f} > threshold {(self.harvest_radius + self.reach_margin):.2f}"
-                        )
+                        if self.verbose:
+                            print(
+                                f"[ENV] Bee {i} failed harvest - distance {current_d:.2f} > threshold {self.harvest_radius:.2f}"
+                            )
                 else:
                     # Lost the claim to another bee
                     rewards[agent] -= 0.1
-                    print(f"[ENV] Bee {i} lost flower {fj} to bee {f.busy_by}")
+                    if self.verbose:
+                        print(f"[ENV] Bee {i} lost flower {fj} to bee {f.busy_by}")
             else:
                 # No valid target found - simple fixed penalty
                 if agent in attempted_harvest:
                     rewards[agent] -= 0.5
-                    print(f"[ENV] Bee {i} attempted harvest but no valid target")
+                    if self.verbose:
+                        print(f"[ENV] Bee {i} attempted harvest but no valid target")
 
         # DONOTHING: no explicit reward/penalty - let harvest success/failure drive behavior
         # (removed progressive penalty tracking)
@@ -1016,9 +1085,10 @@ class BeeForagingEnv(ParallelEnv):
             # TRUNCATED CONDITION 1: All flowers assigned to this bee are harvested
             if bee.assigned_flowers:
                 my_flowers_done = all(self.flowers[fj].harvested for fj in bee.assigned_flowers)
-                if my_flowers_done:
+                if my_flowers_done and not bee.truncated:
                     bee.truncated = True
-                    print(f"[TRUNCATED] Bee {i}: All assigned flowers completed")
+                    if self.verbose:
+                        print(f"[TRUNCATED] Bee {i}: All assigned flowers completed")
 
             # TRUNCATED CONDITION 2: Missed HARD window(s) permanently
             for fj in bee.assigned_flowers:
@@ -1030,7 +1100,8 @@ class BeeForagingEnv(ParallelEnv):
                             bee.missed_hard_windows.add(fj)
                             bee.truncated = True
                             rewards[agent] -= 50.0  # Severe penalty for missing HARD window
-                            print(f"[TRUNCATED] Bee {i}: Missed HARD window for flower {fj}")
+                            if self.verbose:
+                                print(f"[TRUNCATED] Bee {i}: Missed HARD window for flower {fj}")
 
             # TRUNCATED CONDITION 3: All SOFT windows for assigned flowers are permanently unreachable
             if bee.assigned_flowers:
@@ -1051,7 +1122,8 @@ class BeeForagingEnv(ParallelEnv):
 
                 if soft_flowers_unreachable and not bee.truncated:
                     bee.truncated = True
-                    print(f"[TRUNCATED] Bee {i}: No more opportunities for SOFT window flowers")
+                    if self.verbose:
+                        print(f"[TRUNCATED] Bee {i}: No more opportunities for SOFT window flowers")
 
         # Episode terminates only if:
         # 1. All flowers harvested (success), OR
@@ -1070,19 +1142,20 @@ class BeeForagingEnv(ParallelEnv):
 
         # Print episode summary when terminating
         if all_flowers_harvested or episode_failed or self.steps >= self.max_steps:
-            episode_type = "LOW-BATTERY " if self._is_low_battery_episode else "NORMAL"
-            batteries_died = sum(1 for b in self.bees if b.battery <= 0)
-            flowers_harvested = sum(1 for f in self.flowers if f.harvested)
-            print(f"\n[EPISODE END] Type: {episode_type} | Steps: {self.steps}/{self.max_steps}")
-            print(
-                f"[EPISODE END] Flowers: {flowers_harvested}/{len(self.flowers)} | Batteries died: {batteries_died}/{self.num_bees}"
-            )
-            if all_flowers_harvested:
-                print("[EPISODE END]  SUCCESS - All flowers harvested!")
-            elif episode_failed:
-                print("[EPISODE END] FAILED - All bees truncated, no queue tasks")
-            elif self.steps >= self.max_steps:
-                print("[EPISODE END]   TIMEOUT - Max steps reached")
+            if self.verbose:
+                episode_type = "LOW-BATTERY " if self._is_low_battery_episode else "NORMAL"
+                batteries_died = sum(1 for b in self.bees if b.battery <= 0)
+                flowers_harvested = sum(1 for f in self.flowers if f.harvested)
+                print(f"\n[EPISODE END] Type: {episode_type} | Steps: {self.steps}/{self.max_steps}")
+                print(
+                    f"[EPISODE END] Flowers: {flowers_harvested}/{len(self.flowers)} | Batteries died: {batteries_died}/{self.num_bees}"
+                )
+                if all_flowers_harvested:
+                    print("[EPISODE END]  SUCCESS - All flowers harvested!")
+                elif episode_failed:
+                    print("[EPISODE END] FAILED - All bees truncated, no queue tasks")
+                elif self.steps >= self.max_steps:
+                    print("[EPISODE END]   TIMEOUT - Max steps reached")
 
         # Step count
         self.steps += 1
@@ -1253,6 +1326,10 @@ class BeeForagingEnv(ParallelEnv):
                 [can_harvest, can_groom, can_do_nothing], dtype=np.float32
             )
 
+            # HRL: Current goal for this bee (one-hot encoded)
+            goal_onehot = np.zeros(4, dtype=np.float32)
+            goal_onehot[self._current_goals[i]] = 1.0
+
             obs[f"bee_{i}"] = {
                 "position": np.array([fx, fy, fz], dtype=np.float32),
                 "status": np.array([float(bee.mode), load_frac], dtype=np.float32),
@@ -1261,8 +1338,65 @@ class BeeForagingEnv(ParallelEnv):
                 "consensus": np.array(consensus, dtype=np.float32),
                 "retask_board": np.array(retask_feat, dtype=np.float32),
                 "action_availability": action_availability,
+                "goal": goal_onehot,  # HRL goal
             }
         return obs
+
+    # ----------------------------------------------------------
+    # HRL: Goal Management
+    # ----------------------------------------------------------
+    def set_goals(self, goals: np.ndarray):
+        """
+        Set goals for all bees (called by Manager policy).
+        
+        Args:
+            goals: (num_bees,) array of goal indices
+                0 = IDLE, 1 = HARVEST, 2 = GROOM, 3 = ASSIST
+        """
+        self._current_goals = np.array(goals, dtype=int)
+        self._goal_set_step[:] = self.steps
+    
+    def get_goal_reward(self, bee_id: int, action: int) -> float:
+        """
+        Compute reward shaping based on goal alignment.
+        
+        Returns bonus/penalty based on whether action aligns with current goal.
+        """
+        goal = self._current_goals[bee_id]
+        bee = self.bees[bee_id]
+        
+        # Goal 0: IDLE - reward DONOTHING when waiting is appropriate
+        if goal == 0:
+            if action == 0:  # DONOTHING
+                return 0.1  # Small bonus for following IDLE goal
+            else:
+                return -0.05  # Small penalty for acting when told to idle
+        
+        # Goal 1: HARVEST - reward harvesting
+        elif goal == 1:
+            if action == 1:  # HARVEST
+                return 0.2  # Bonus for attempting harvest when told to
+            elif action == 0:  # DONOTHING
+                return -0.1  # Penalty for idling when should harvest
+            else:
+                return 0.0
+        
+        # Goal 2: GROOM - reward grooming
+        elif goal == 2:
+            if action == 2:  # GROOM
+                return 0.3  # Good bonus for grooming when told to
+            else:
+                return -0.1 if bee.load >= bee.capacity * 0.5 else 0.0
+        
+        # Goal 3: ASSIST - reward claiming from retask board
+        elif goal == 3:
+            # Check if bee took a task from retask board
+            if hasattr(bee, 'retask_board') and len(bee.retask_board) > 0:
+                if action == 1:  # HARVEST (attempting to help)
+                    return 0.15
+            return 0.0
+        
+        return 0.0
 
     # ----------------------------------------------------------
     # Helpers (reachability & global state)
@@ -1270,7 +1404,21 @@ class BeeForagingEnv(ParallelEnv):
     def _make_flower(self, fid, x, y):
         start = np.random.randint(self.time_window_min, self.time_window_max)
         end = start + np.random.randint(15, 40)
-        f = bee_state.Flower(fid, self.grid_size, window_start=start, window_end=end)
+        # Randomly assign time window type so the manager must schedule
+        wtype_roll = np.random.random()
+        if wtype_roll < 0.35:
+            wtype = "HARD"   # 35% hard deadline
+        elif wtype_roll < 0.65:
+            wtype = "SOFT"   # 30% soft/repeating window
+            period = np.random.randint(40, 120)  # repeats every 40-120 steps
+        else:
+            wtype = "NONE"   # 35% always available
+        period = period if wtype == "SOFT" else None
+        f = bee_state.Flower(
+            fid, self.grid_size,
+            window_start=start, window_end=end,
+            window_type=wtype, window_period=period,
+        )
         f.x = int(np.clip(x, 0, self.grid_size - 1))
         f.y = int(np.clip(y, 0, self.grid_size - 1))
         return f
@@ -1646,6 +1794,12 @@ class BeeForagingEnv(ParallelEnv):
                     self.assignments[winner_bee_id].append(flower_idx)
                     self.bees[winner_bee_id].assigned_flowers.append(flower_idx)
 
+    # ---------- Helper: Clear task from all retask boards ----------
+    def _clear_task_from_all_boards(self, flower_id: int):
+        """Remove a flower from all bees' retask boards (when accepted or harvested)."""
+        for bee in self.bees:
+            bee.retask_board = [t for t in bee.retask_board if t["flower_id"] != flower_id]
+
     # ---------- Per-bee retask board propagation (v2) ----------
     def _propagate_retask_board(self):
         """
@@ -1747,13 +1901,15 @@ class BeeForagingEnv(ParallelEnv):
                     f.assigned_bee = i
                     if fj not in bee.assigned_flowers:
                         bee.assigned_flowers.append(fj)
+                        # Clear this task from ALL bees' retask boards to prevent duplicates
+                        self._clear_task_from_all_boards(fj)
+                        if self.verbose:
+                            print(
+                                f"[COMM] Bee {i} ACCEPTS task (flower {fj}) "
+                                f"[priority={priority_score:.1f}, urgency={urgency_score:.1f}, "
+                                f"hops={task['hops']}, src_bee={task['source_bee']}]"
+                            )
                     tasks_accepted.append(task_idx)
-                    if self.verbose:
-                        print(
-                            f"[COMM] Bee {i} ACCEPTS task (flower {fj}) "
-                            f"[priority={priority_score:.1f}, urgency={urgency_score:.1f}, "
-                            f"hops={task['hops']}, src_bee={task['source_bee']}]"
-                        )
                 else:
                     # REJECT: Cannot or should not accept - mark for handoff
                     reason = []
@@ -1801,20 +1957,28 @@ class BeeForagingEnv(ParallelEnv):
                 if nearest_bee_id is not None:
                     tasks_passed = 0
                     last_task = None
+                    target_bee = self.bees[nearest_bee_id]
+                    existing_in_board = {t["flower_id"] for t in target_bee.retask_board}
                     for idx in sorted(tasks_to_handoff, reverse=True):
                         if idx < len(bee.retask_board):
                             task = bee.retask_board.pop(idx)
+                            fj = task["flower_id"]
+                            # Skip if target already has this task or flower is harvested
+                            if fj in existing_in_board:
+                                continue
+                            if fj < len(self.flowers) and self.flowers[fj].harvested:
+                                continue
                             task["hops"] += 1
                             task["received_step"] = self.steps
                             # Preserve flower metadata for next bee's decision
-                            fj = task["flower_id"]
                             if fj < len(self.flowers):
                                 f = self.flowers[fj]
                                 task["priority"] = f.priority
                                 task["window_type"] = f.window_type
                                 task["window_end"] = f.window_end
                                 task["pollen"] = f.pollen
-                            self.bees[nearest_bee_id].retask_board.append(task)
+                            target_bee.retask_board.append(task)
+                            existing_in_board.add(fj)
                             tasks_passed += 1
                             last_task = task
                     

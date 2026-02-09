@@ -494,8 +494,10 @@ def main():
                 "sgp4_km_per_unit",
                 "sgp4_time_stagger_s",
                 "tle_lines",
+                "low_battery_chance",
             ]
-        }
+        },
+        low_battery_chance=0.0,  # Disable low-battery episodes for visualization
     )
     _ = env.reset()
     num_bees = len(env.bees)

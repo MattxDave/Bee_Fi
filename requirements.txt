@@ -4,6 +4,8 @@
 # Core ML
 torch>=2.0.0
 numpy>=1.21.0
+scipy>=1.9.0
+sgp4>=2.20  # For satellite TLE orbital tracking
 
 # Visualization
 matplotlib>=3.5.0

@@ -446,6 +446,7 @@ class TrainedModelPolicy:
             action_dim=action_dim,
             num_flowers=num_flowers,
             retask_board_size=retask_board_size,
+            grid_size=getattr(env, "grid_size", 50),
         ).to(device)
         self.actor.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         self.actor.eval()
