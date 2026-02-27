@@ -14,7 +14,6 @@ Goals:
 import math
 import torch
 import torch.nn as nn
-import numpy as np
 
 
 class ManagerPolicy(nn.Module):
@@ -200,6 +199,7 @@ class GoalConditionedWorker(nn.Module):
         # --- Feature Encoders (same as original Actor) ---
         self.position_fc = nn.Sequential(nn.Linear(3, 64), nn.LayerNorm(64), nn.ReLU())
         self.status_fc = nn.Sequential(nn.Linear(2, 32), nn.LayerNorm(32), nn.ReLU())
+        self.battery_fc = nn.Sequential(nn.Linear(2, 32), nn.LayerNorm(32), nn.ReLU())
         self.step_fc = nn.Sequential(nn.Linear(1, 32), nn.LayerNorm(32), nn.ReLU())
         self.cons_fc = nn.Sequential(nn.Linear(num_bees, 64), nn.LayerNorm(64), nn.ReLU())
         self.action_availability_fc = nn.Sequential(nn.Linear(3, 32), nn.LayerNorm(32), nn.ReLU())
@@ -239,9 +239,9 @@ class GoalConditionedWorker(nn.Module):
             )
             retask_board_dim = 128
         
-        # Trunk input: original + goal embedding
-        # 64 + 32 + 128 + 32 + 64 + retask_board_dim + 32 + 32 (goal)
-        trunk_input = 64 + 32 + self.flower_embed_dim + 32 + 64 + retask_board_dim + 32 + 32
+        # Trunk input: original + battery + goal embedding
+        # 64 + 32 + 32(battery) + 128 + 32 + 64 + retask_board_dim + 32 + 32 (goal)
+        trunk_input = 64 + 32 + 32 + self.flower_embed_dim + 32 + 64 + retask_board_dim + 32 + 32
         
         self.trunk = nn.Sequential(
             nn.Linear(trunk_input, hidden_dim),
@@ -283,6 +283,7 @@ class GoalConditionedWorker(nn.Module):
         # Normalize inputs
         position = ensure2d(obs_dict["position"]) / self.grid_size
         status = ensure2d(obs_dict["status"])
+        battery = ensure2d(obs_dict.get("battery", torch.zeros(1, 2, device=position.device)))
         
         # Flower attention
         flowers = ensure2d(obs_dict["flowers"])
@@ -312,6 +313,7 @@ class GoalConditionedWorker(nn.Module):
         # Encode all features
         pos_out = self.position_fc(position)
         sta_out = self.status_fc(status)
+        bat_out = self.battery_fc(battery)
         stp_out = self.step_fc(step_count)
         con_out = self.cons_fc(consensus)
         
@@ -334,9 +336,9 @@ class GoalConditionedWorker(nn.Module):
         
         # Concatenate all features including goal
         if rtb_out is not None:
-            h = torch.cat([pos_out, sta_out, flw_out, stp_out, con_out, rtb_out, aa_out, goal_out], dim=-1)
+            h = torch.cat([pos_out, sta_out, bat_out, flw_out, stp_out, con_out, rtb_out, aa_out, goal_out], dim=-1)
         else:
-            h = torch.cat([pos_out, sta_out, flw_out, stp_out, con_out, aa_out, goal_out], dim=-1)
+            h = torch.cat([pos_out, sta_out, bat_out, flw_out, stp_out, con_out, aa_out, goal_out], dim=-1)
         
         h = self.trunk(h)
         action_logits = self.policy_head(h)

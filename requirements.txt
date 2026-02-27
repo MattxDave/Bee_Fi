@@ -1,15 +1,22 @@
-# Bee Swarm RL - Requirements
-# Python 3.8+ required
+# Bee_Fi - Multi-Agent Satellite Task Scheduling
+# Python 3.10+ required
 
 # Core ML
 torch>=2.0.0
 numpy>=1.21.0
 scipy>=1.9.0
-sgp4>=2.20  # For satellite TLE orbital tracking
 
-# Visualization
+# Orbital mechanics
+sgp4>=2.20
+
+# Visualization (matplotlib backend)
 matplotlib>=3.5.0
 Pillow>=9.0.0
+
+# Interactive dashboard
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+plotly>=5.18.0
 
 # RL Environment
 pettingzoo>=1.24.0

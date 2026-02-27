@@ -78,7 +78,7 @@ class BeeForagingEnv(ParallelEnv):
         grid_size=20,
         max_steps=800,
         time_window_min=10,
-        time_window_max=80,
+        time_window_max=150,
         harvest_radius=18.0,  # Euclidean distance from current bee position to flower
         lambda_z=0.1,
         knn_k=3,
@@ -87,7 +87,7 @@ class BeeForagingEnv(ParallelEnv):
         shaping_weight=0.05,
         anti_spam_pen=-0.005,
         reach_margin=5.0,  # Increased margin for orbital reachability
-        reach_samples=120,
+        reach_samples=48,
         bee_capacity: float = 10.0,
         # ---------- SGP4 toggles ----------
         use_sgp4: bool = False,
@@ -150,6 +150,7 @@ class BeeForagingEnv(ParallelEnv):
         self.drain_per_step = float(drain_per_step)
         self.drain_per_unit = float(drain_per_unit)
         self.low_battery_chance = float(low_battery_chance)
+        self._episode_drain_per_step = float(drain_per_step)  # Per-episode drain (set in reset)
 
         # Track if this is a low-battery training episode
         self._is_low_battery_episode = False
@@ -288,37 +289,30 @@ class BeeForagingEnv(ParallelEnv):
         # Battery init with random low-battery episodes for retasking learning
         rng = np.random.default_rng()
 
-        # Configurable chance of "low battery episode" to force retasking scenarios
-        if rng.random() < self.low_battery_chance:
-            # Low battery episode: batteries will die mid-episode, forcing task reassignment
-            self._is_low_battery_episode = True
-            battery_min = max(50, self.battery_min_steps // 3)  # Much shorter battery
-            battery_max = max(100, self.battery_max_steps // 3)
-            self._battery_max = rng.integers(
-                battery_min, battery_max + 1, size=self.num_bees
-            ).astype(float)
-
-            # Also increase drain rate for low-battery episodes to ensure batteries die
-            self.drain_per_step = self.drain_per_step * rng.uniform(2.0, 3.0)
-
-            if self.verbose:
-                print(
-                    f"[BATTERY]  Low-battery training episode - max={battery_max}, drain={self.drain_per_step:.1f}x"
-                )
-                print("[BATTERY] Batteries WILL die during episode to practice retasking!")
+        # Curriculum learning: 30% of episodes use low-battery mode
+        if self.low_battery_chance > 0 and random.random() < self.low_battery_chance:
+            # Use local variable instead of mutating class attribute
+            episode_drain_per_step = self.drain_per_step * random.uniform(2.0, 3.0)
+            episode_battery_min_steps = int(self.battery_min_steps * 0.33)
+            episode_battery_max_steps = int(self.battery_max_steps * 0.33)
+            self.episode_type = "LOW_BATTERY"
         else:
-            # Normal episode: standard battery capacity
-            self._is_low_battery_episode = False
-            self._battery_max = rng.integers(
-                self.battery_min_steps, self.battery_max_steps + 1, size=self.num_bees
-            ).astype(float)
+            episode_drain_per_step = self.drain_per_step
+            episode_battery_min_steps = self.battery_min_steps
+            episode_battery_max_steps = self.battery_max_steps
 
-        self._battery = self._battery_max.copy()
+        # Apply episode-local battery settings
+        for i in range(self.num_bees):
+            cap = random.randint(episode_battery_min_steps, episode_battery_max_steps)
+            self._battery_max[i] = float(cap)
+            self._battery[i] = float(cap)
+        self._episode_drain_per_step = episode_drain_per_step  # Store for use in step()
         self._recharge_until[:] = -1
         for i, b in enumerate(self.bees):
             self._last_pos[i] = np.array([float(b.fx), float(b.fy), float(b.fz)], dtype=float)
 
         # Reachability + harvestable mask
+        self._cached_orbit_points = None  # reset orbit cache for new episode
         self._mark_reachable_per_bee()
         self.harvestable = np.zeros(self.num_flowers, dtype=bool)
         for j, f in enumerate(self.flowers):
@@ -634,23 +628,19 @@ class BeeForagingEnv(ParallelEnv):
                     if self._battery_max[i] > 0
                     else 1.0
                 )
-                needs_groom = (bee.load >= bee.capacity * 0.8) or (battery_ratio <= 0.3)
+                needs_groom = (bee.load >= bee.capacity * 0.8) or (self._battery[i] <= 0.0)
 
                 if needs_groom or not should_do_nothing:
-                    rewards[agent_id] -= 0.1
+                    rewards[agent_id] -= 0.02
                 elif has_harvest_now:
-                    rewards[agent_id] -= 0.05
+                    rewards[agent_id] -= 0.01
                 else:
-                    rewards[agent_id] += 0.05
-
-        # Claim resolution: process retask board claims and assign flower to winner
-        if claims:
-            self._resolve_claims(claims, rewards)
+                    rewards[agent_id] += 0.01
 
         # Re-task silent bees
         self._retask_silent_bees()
 
-        # Per-bee retask board propagation (v2)
+        # Per-bee chain relay: advance traveling boards one hop per step
         self._propagate_retask_board()
 
         # clear per-step busy flags
@@ -674,7 +664,7 @@ class BeeForagingEnv(ParallelEnv):
         # -------------------- explicit GROOM action --------------------
         # GROOM serves two purposes:
         #   1. Offload pollen (when load >= 80% capacity)
-        #   2. Recharge battery (when battery <= 30% max)
+        #   2. Recharge battery (when battery is DEAD, i.e. reaches 0)
         for agent, a in actions.items():
             if a != 2:
                 continue
@@ -683,11 +673,10 @@ class BeeForagingEnv(ParallelEnv):
 
             # Check both GROOM conditions
             needs_pollen_offload = bee.load >= bee.capacity * 0.8
-            battery_ratio = self._battery[i] / self._battery_max[i] if self._battery_max[i] > 0 else 1.0
-            needs_battery_recharge = battery_ratio <= 0.3
+            needs_battery_recharge = self._battery[i] <= 0.0  # Battery must be dead (at 0)
 
-            # Already recharging? Can't groom again
-            if self._recharge_until[i] > self.steps:
+            # Already recharging (or completion step)? Can't groom again
+            if self._recharge_until[i] >= self.steps:
                 rewards[agent] -= 0.1  # Small penalty for trying to groom while recharging
                 if self.verbose:
                     if self.verbose:
@@ -696,19 +685,18 @@ class BeeForagingEnv(ParallelEnv):
 
             # Priority: Battery recharge takes precedence over pollen offload
             if needs_battery_recharge:
-                # Initiate battery recharge via GROOM
-                old_battery = self._battery[i]
+                # Battery is dead (0) — initiate recharge via GROOM
                 self._recharge_until[i] = self.steps + self.recharge_steps
                 bee.mode = bee_state.Bee.GROOMING
                 bee.groom_cooldown = 1
 
-                # Reward based on how proactive the recharge is (more reward for not waiting until 0)
-                recharge_reward = 8.0 + 5.0 * battery_ratio  # 8-9.5 reward (proactive is better)
+                # Reward for grooming to recharge when battery is dead
+                recharge_reward = 8.0
                 rewards[agent] += recharge_reward
 
                 if self.verbose:
                     print(
-                        f"[ENV] Bee {i} GROOM→RECHARGE (battery {old_battery:.1f}/{self._battery_max[i]:.1f}, reward: {recharge_reward:.1f})"
+                        f"[ENV] Bee {i} GROOM→RECHARGE (battery DEAD, reward: {recharge_reward:.1f})"
                     )
 
             elif needs_pollen_offload:
@@ -732,7 +720,7 @@ class BeeForagingEnv(ParallelEnv):
                     )
             else:
                 # Neither condition met - unnecessary groom
-                rewards[agent] -= 0.3  # Moderate penalty for unnecessary groom
+                rewards[agent] -= 0.1  # Small penalty for unnecessary groom
                 bee.mode = bee_state.Bee.IDLE
                 bee.groom_cooldown = 0
                 if self.verbose:
@@ -764,9 +752,10 @@ class BeeForagingEnv(ParallelEnv):
                         if f.harvested:
                             continue
 
-                        # Can harvest: flowers assigned to this bee OR unassigned flowers (released by dead bees)
+                        # Can only harvest flowers assigned to this bee OR
+                        # unassigned flowers (claimed from retask board)
                         if f.assigned_bee is not None and f.assigned_bee != i:
-                            continue  # Skip flowers assigned to other active bees
+                            continue  # Skip flowers assigned to other bees
 
                         cx, cy = f.center_xy
                         dx, dy, dz = fx - cx, fy - cy, fz
@@ -789,7 +778,7 @@ class BeeForagingEnv(ParallelEnv):
                         else:
                             rewards[
                                 agent
-                            ] -= 1.0  # Stronger penalty to discourage harvest spam (was -0.2)
+                            ] -= 0.2  # Mild penalty for harvest when nothing in range
 
         # Resolve exclusivity (closest bee wins per flower)
         claims = {}
@@ -807,35 +796,8 @@ class BeeForagingEnv(ParallelEnv):
             # FIRST: Check if recharge just completed - refill battery BEFORE movement
             if (self._recharge_until[i] == self.steps) and (self._battery[i] == 0.0):
                 self._battery[i] = self._battery_max[i]
-
-                # BATTERY RECHARGED: Reassign available unharvested flowers
-                available_flowers = [
-                    j
-                    for j, f in enumerate(self.flowers)
-                    if not f.harvested and f.assigned_bee is None
-                ]
-                if available_flowers:
-                    # Sort by pollen descending to prioritize high-value flowers
-                    available_flowers.sort(key=lambda j: self.flowers[j].pollen, reverse=True)
-
-                    # Give this bee some flowers (round-robin style)
-                    num_to_assign = min(
-                        len(available_flowers), max(1, len(available_flowers) // self.num_bees)
-                    )
-                    for fj in available_flowers[:num_to_assign]:
-                        self.flowers[fj].assigned_bee = i
-                        if fj not in bee.assigned_flowers:
-                            bee.assigned_flowers.append(fj)
-
-                    if self.verbose:
-                        print(
-                            f"[BATTERY] Bee {i} recharged to {self._battery[i]:.1f} - reassigned {num_to_assign} flowers from pool"
-                        )
-                else:
-                    if self.verbose:
-                        print(
-                            f"[BATTERY] Bee {i} recharged to {self._battery[i]:.1f} - no flowers available to reassign"
-                        )
+                if self.verbose:
+                    print(f"[BATTERY] Bee {i} recharged to {self._battery[i]:.1f}")
 
             if self._recharge_until[i] > self.steps:
                 # Charging: freeze position
@@ -847,7 +809,7 @@ class BeeForagingEnv(ParallelEnv):
                 dz = float(b.fz) - prev[2]
                 dist = math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
                 if dist > 0.0:
-                    self._battery[i] -= self.drain_per_step + self.drain_per_unit * dist
+                    self._battery[i] -= self._episode_drain_per_step + self.drain_per_unit * dist
 
                 # Battery must reach exactly 0 before bee stops working
                 if self._battery[i] <= 0.0:
@@ -855,82 +817,75 @@ class BeeForagingEnv(ParallelEnv):
                     self._recharge_until[i] = self.steps + self.recharge_steps
 
                     # =========================================================
-                    # NEW: Per-bee retasking - broadcast tasks to nearest bee
+                    # CHAIN RELAY: Dead bee creates a traveling board
                     # =========================================================
                     if bee.assigned_flowers:
-                        # Find nearest active bee
-                        nearest_bee_id = None
-                        min_dist = float("inf")
-                        
-                        for j in range(self.num_bees):
-                            if i == j:
-                                continue
-                            other = self.bees[j]
-                            if other.truncated or self._recharge_until[j] > self.steps:
-                                continue  # Skip truncated or recharging bees
-                            
-                            # Calculate 3D distance
-                            dx = other.fx - bee.fx
-                            dy = other.fy - bee.fy
-                            dz = other.fz - bee.fz
-                            dist = math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
-                            
-                            if dist < min_dist:
-                                min_dist = dist
-                                nearest_bee_id = j
-                        
-                        # Broadcast to nearest bee with full task metadata
-                        tasks_broadcast = 0
-                        if nearest_bee_id is not None:
-                            target_bee = self.bees[nearest_bee_id]
-                            # Get existing flower IDs in target's retask_board to avoid duplicates
-                            existing_in_board = {t["flower_id"] for t in target_bee.retask_board}
-                            for fj in bee.assigned_flowers:
-                                # Skip if already in target's board or already harvested
-                                if fj in existing_in_board:
+                        # Build traveling board with all the dead bee's tasks
+                        traveling_tasks = []
+                        for fj in bee.assigned_flowers:
+                            if fj < len(self.flowers) and not self.flowers[fj].harvested:
+                                f = self.flowers[fj]
+                                # Unassign flower from dead bee
+                                f.assigned_bee = None
+                                traveling_tasks.append({
+                                    "flower_id": fj,
+                                    "source_bee": i,
+                                    "hops": 0,
+                                    "received_step": self.steps,
+                                    "pollen": f.pollen,
+                                    "priority": f.priority,
+                                    "window_type": f.window_type,
+                                    "window_start": f.window_start,
+                                    "window_end": f.window_end,
+                                    "x": f.x,
+                                    "y": f.y,
+                                    "seen_by": {i},  # Dead bee has "seen" it
+                                })
+
+                        if traveling_tasks:
+                            # Find nearest active bee to receive the board first
+                            nearest_bee_id = None
+                            min_d = float("inf")
+                            for j in range(self.num_bees):
+                                if j == i:
                                     continue
-                                if fj < len(self.flowers) and not self.flowers[fj].harvested:
-                                    f = self.flowers[fj]
-                                    task = {
-                                        "flower_id": fj,
-                                        "source_bee": i,
-                                        "hops": 1,
-                                        "received_step": self.steps,
-                                        # Full metadata for decision-making
-                                        "pollen": f.pollen,
-                                        "priority": f.priority,
-                                        "window_type": f.window_type,
-                                        "window_start": f.window_start,
-                                        "window_end": f.window_end,
-                                        "x": f.x,
-                                        "y": f.y,
-                                    }
-                                    target_bee.retask_board.append(task)
-                                    existing_in_board.add(fj)  # Track to avoid duplicates
-                                    tasks_broadcast += 1
-                            
-                            self.bees[nearest_bee_id].last_received_from = i
-                            bee.last_broadcast_to = nearest_bee_id
-                            
-                            if self.verbose:
-                                print(
-                                    f"[RETASK] Bee {i} dead → broadcast {tasks_broadcast} tasks "
-                                    f"to nearest bee {nearest_bee_id} (dist: {min_dist:.2f})"
-                                )
-                        else:
-                            # No active bee found - release to global pool
-                            for fj in bee.assigned_flowers:
-                                if fj < len(self.flowers) and not self.flowers[fj].harvested:
-                                    self.flowers[fj].assigned_bee = None
-                                    if self.flowers[fj].busy_by == i:
-                                        self.flowers[fj].busy_by = None
-                            if self.verbose:
-                                print(
-                                    f"[RETASK] Bee {i} dead → no active bees, "
-                                    f"releasing {len(bee.assigned_flowers)} to global pool"
-                                )
-                        
-                        bee.assigned_flowers = []  # Clear assignments
+                                other = self.bees[j]
+                                if other.truncated or self._recharge_until[j] > self.steps:
+                                    continue
+                                dx2 = other.fx - bee.fx
+                                dy2 = other.fy - bee.fy
+                                dz2 = other.fz - bee.fz
+                                d2 = math.sqrt(dx2*dx2 + dy2*dy2 + self.lambda_z*dz2*dz2)
+                                if d2 < min_d:
+                                    min_d = d2
+                                    nearest_bee_id = j
+
+                            if nearest_bee_id is not None:
+                                target = self.bees[nearest_bee_id]
+                                existing = {t["flower_id"] for t in target.retask_board}
+                                for t in traveling_tasks:
+                                    if t["flower_id"] not in existing:
+                                        t["hops"] = 1
+                                        t["received_step"] = self.steps
+                                        target.retask_board.append(t)
+                                        existing.add(t["flower_id"])
+                                if self.verbose:
+                                    print(
+                                        f"[CHAIN] Bee {i} dead → traveling board "
+                                        f"({len(traveling_tasks)} tasks) sent to "
+                                        f"bee {nearest_bee_id} (dist: {min_d:.2f})"
+                                    )
+                            else:
+                                # No active bee - release flowers to unassigned pool
+                                if self.verbose:
+                                    print(
+                                        f"[CHAIN] Bee {i} dead → no active bees, "
+                                        f"releasing {len(traveling_tasks)} to pool"
+                                    )
+
+                        bee.assigned_flowers = []  # Clear dead bee's assignments
+                        if i in self.assignments:
+                            self.assignments[i] = []
 
                     if self.verbose:
                         print(
@@ -951,6 +906,7 @@ class BeeForagingEnv(ParallelEnv):
                 break
 
         if orbit_changed:
+            self._cached_orbit_points = None  # invalidate orbit cache
             self._mark_reachable_per_bee()
             self.harvestable = np.zeros(self.num_flowers, dtype=bool)
             for j, f in enumerate(self.flowers):
@@ -1018,7 +974,7 @@ class BeeForagingEnv(ParallelEnv):
                         capacity_bonus = 3.0 * (1.0 - bee.load / bee.capacity)
                         # NEW: Bonus for hitting time windows
                         window_bonus = (
-                            5.0
+                            15.0
                             if f.window_type == "HARD"
                             else (2.0 if f.window_type == "SOFT" else 0.0)
                         )
@@ -1034,7 +990,7 @@ class BeeForagingEnv(ParallelEnv):
                             )
                     elif not in_time_window:
                         # NEW: Attempted harvest outside time window
-                        rewards[agent] -= 2.0
+                        rewards[agent] -= 0.5
                         if self.verbose:
                             print(
                                 f"[ENV] Bee {i} MISSED TIME WINDOW for flower {fj} (type: {f.window_type})"
@@ -1045,7 +1001,7 @@ class BeeForagingEnv(ParallelEnv):
                             bee.missed_hard_windows.add(fj)
                     else:
                         # Too far or already harvested - simple fixed penalty
-                        rewards[agent] -= 0.5
+                        rewards[agent] -= 0.2
                         if self.verbose:
                             print(
                                 f"[ENV] Bee {i} failed harvest - distance {current_d:.2f} > threshold {self.harvest_radius:.2f}"
@@ -1058,7 +1014,7 @@ class BeeForagingEnv(ParallelEnv):
             else:
                 # No valid target found - simple fixed penalty
                 if agent in attempted_harvest:
-                    rewards[agent] -= 0.5
+                    rewards[agent] -= 0.2
                     if self.verbose:
                         print(f"[ENV] Bee {i} attempted harvest but no valid target")
 
@@ -1090,7 +1046,7 @@ class BeeForagingEnv(ParallelEnv):
                     if self.verbose:
                         print(f"[TRUNCATED] Bee {i}: All assigned flowers completed")
 
-            # TRUNCATED CONDITION 2: Missed HARD window(s) permanently
+            # PENALTY CONDITION: Missed HARD window(s) permanently (no truncation)
             for fj in bee.assigned_flowers:
                 f = self.flowers[fj]
                 if f.window_type == "HARD" and not f.harvested:
@@ -1098,10 +1054,9 @@ class BeeForagingEnv(ParallelEnv):
                     if self.steps > f.window_end:
                         if fj not in bee.missed_hard_windows:
                             bee.missed_hard_windows.add(fj)
-                            bee.truncated = True
-                            rewards[agent] -= 50.0  # Severe penalty for missing HARD window
+                            rewards[agent] -= 5.0  # Penalty for missing HARD window
                             if self.verbose:
-                                print(f"[TRUNCATED] Bee {i}: Missed HARD window for flower {fj}")
+                                print(f"[PENALTY] Bee {i}: Missed HARD window for flower {fj} (-5.0)")
 
             # TRUNCATED CONDITION 3: All SOFT windows for assigned flowers are permanently unreachable
             if bee.assigned_flowers:
@@ -1296,11 +1251,11 @@ class BeeForagingEnv(ParallelEnv):
                 # Only allow harvest if actually in range (dist_norm < 1.0 means within harvest_radius)
                 in_range = dist_norm < 1.0
 
-                # Can harvest flowers assigned to this bee OR unassigned flowers (from pool)
+                # Can only harvest flowers assigned to this bee or unassigned (from retask board)
                 is_mine = f.assigned_bee == i
-                is_unassigned = f.assigned_bee is None  # Released from dead bee's queue
+                is_unassigned = f.assigned_bee is None
 
-                # Can harvest if: (mine OR unassigned), reachable, in range, in time window, and fits
+                # Can harvest if: (mine OR unassigned), in range, in time window, and fits
                 if (
                     (is_mine or is_unassigned)
                     and in_range
@@ -1330,9 +1285,14 @@ class BeeForagingEnv(ParallelEnv):
             goal_onehot = np.zeros(4, dtype=np.float32)
             goal_onehot[self._current_goals[i]] = 1.0
 
+            # Battery observation: fraction remaining + recharging flag
+            battery_frac = self._battery[i] / self._battery_max[i] if self._battery_max[i] > 0 else 1.0
+            is_recharging = 1.0 if self._recharge_until[i] > self.steps else 0.0
+
             obs[f"bee_{i}"] = {
                 "position": np.array([fx, fy, fz], dtype=np.float32),
                 "status": np.array([float(bee.mode), load_frac], dtype=np.float32),
+                "battery": np.array([battery_frac, is_recharging], dtype=np.float32),
                 "flowers": np.array(flowers_feat, dtype=np.float32),
                 "step_count": np.array([self.steps / max(1.0, self.max_steps)], dtype=np.float32),
                 "consensus": np.array(consensus, dtype=np.float32),
@@ -1402,18 +1362,34 @@ class BeeForagingEnv(ParallelEnv):
     # Helpers (reachability & global state)
     # ----------------------------------------------------------
     def _make_flower(self, fid, x, y):
-        start = np.random.randint(self.time_window_min, self.time_window_max)
-        end = start + np.random.randint(15, 40)
         # Randomly assign time window type so the manager must schedule
         wtype_roll = np.random.random()
-        if wtype_roll < 0.35:
-            wtype = "HARD"   # 35% hard deadline
-        elif wtype_roll < 0.65:
+        if wtype_roll < 0.15:
+            wtype = "HARD"   # 15% hard deadline (rare, high-pressure)
+        elif wtype_roll < 0.45:
             wtype = "SOFT"   # 30% soft/repeating window
-            period = np.random.randint(40, 120)  # repeats every 40-120 steps
         else:
-            wtype = "NONE"   # 35% always available
-        period = period if wtype == "SOFT" else None
+            wtype = "NONE"   # 55% always available
+
+        if wtype == "SOFT":
+            # SOFT: repeating window with period. start/end are RELATIVE to period.
+            period = np.random.randint(40, 120)  # repeats every 40-120 steps
+            # Window occupies 40-70% of the period (meaningful on/off pattern)
+            duty = np.random.uniform(0.4, 0.7)
+            duration = max(10, int(period * duty))
+            start = np.random.randint(0, period - duration + 1)
+            end = start + duration
+        elif wtype == "HARD":
+            # HARD: one-shot absolute window
+            start = np.random.randint(self.time_window_min, self.time_window_max)
+            end = start + np.random.randint(80, 160)
+            period = None
+        else:
+            # NONE: always available, window values don't matter
+            start = 0
+            end = self.max_steps
+            period = None
+
         f = bee_state.Flower(
             fid, self.grid_size,
             window_start=start, window_end=end,
@@ -1434,6 +1410,34 @@ class BeeForagingEnv(ParallelEnv):
         c, s = math.cos(a), math.sin(a)
         return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=float)
 
+    def _precompute_orbit_points(self):
+        """Precompute orbit sample points for all bees (vectorized).
+        Cached and reused until orbits change. Returns (B, S, 3) world-frame points."""
+        B = self.num_bees
+        S = self.reach_samples
+        cx, cy = self.grid_size / 2.0, self.grid_size / 2.0
+        nu = np.linspace(0, 2 * np.pi, S, endpoint=False)  # (S,)
+        cos_nu = np.cos(nu)  # (S,)
+        sin_nu = np.sin(nu)  # (S,)
+
+        all_points = np.empty((B, S, 3), dtype=np.float64)
+        for idx, bee in enumerate(self.bees):
+            a = float(bee.a)
+            e = float(bee.e)
+            i_ = float(bee.i + getattr(bee, "inclination_delta", 0.0))
+            Om = float(bee.Omega + getattr(bee, "yaw_delta", 0.0))
+            om = float(bee.omega)
+            R = self._R3(Om) @ self._R1(i_) @ self._R3(om)  # (3,3)
+            bsemi = a * math.sqrt(max(1e-12, 1 - e * e))
+            # Local orbit points: (3, S)
+            local = np.vstack([a * cos_nu, bsemi * sin_nu, np.zeros(S)])
+            world = R @ local  # (3, S)
+            all_points[idx, :, 0] = cx + world[0]
+            all_points[idx, :, 1] = cy + world[1]
+            all_points[idx, :, 2] = world[2]
+        self._cached_orbit_points = all_points
+        return all_points
+
     def _min_distance_to_orbit(self, bee, x_center, y_center):
         # In telemetry mode, use direct position distance (no orbital mechanics)
         if getattr(self, '_telemetry_loaded', False):
@@ -1441,50 +1445,58 @@ class BeeForagingEnv(ParallelEnv):
             dy = bee.fy - y_center
             dz = bee.fz
             return math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
-        
-        cx, cy = self.grid_size / 2.0, self.grid_size / 2.0
-        px, py, pz = float(x_center), float(y_center), 0.0
-        a, e = float(bee.a), float(bee.e)
-        i = float(bee.i + getattr(bee, "inclination_delta", 0.0))
-        Om = float(bee.Omega + getattr(bee, "yaw_delta", 0.0))
-        om = float(bee.omega)
-        R = self._R3(Om) @ self._R1(i) @ self._R3(om)
-        bsemi = a * math.sqrt(max(1e-12, 1 - e * e))
-        best = np.inf
-        for k in range(self.reach_samples):
-            nu = 2.0 * math.pi * (k / self.reach_samples)
-            r_local = np.array([a * math.cos(nu), bsemi * math.sin(nu), 0.0], float)
-            r_world = R @ r_local
-            ox, oy, oz = cx + r_world[0], cy + r_world[1], r_world[2]
-            dx, dy, dz = px - ox, py - oy, pz - oz
-            d = math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
-            if d < best:
-                best = d
-        return best
+        # Find bee index
+        bee_idx = next((i for i, b in enumerate(self.bees) if b is bee), 0)
+        if not hasattr(self, '_cached_orbit_points') or self._cached_orbit_points is None:
+            self._precompute_orbit_points()
+        pts = self._cached_orbit_points[bee_idx]  # (S, 3)
+        dx = float(x_center) - pts[:, 0]
+        dy = float(y_center) - pts[:, 1]
+        dz = 0.0 - pts[:, 2]
+        dists = np.sqrt(dx*dx + dy*dy + self.lambda_z * dz*dz)
+        return float(dists.min())
+
+    def _min_distance_to_orbit_batch(self, flower_centers):
+        """Compute min orbit distance for ALL bees × ALL flowers at once.
+        flower_centers: (F, 2) array of (x, y).
+        Returns: (B, F) array of minimum distances.
+        """
+        if not hasattr(self, '_cached_orbit_points') or self._cached_orbit_points is None:
+            self._precompute_orbit_points()
+        pts = self._cached_orbit_points  # (B, S, 3)
+        B, S = pts.shape[0], pts.shape[1]
+        F = flower_centers.shape[0]
+        # Flower positions: (F, 3) with z=0
+        fp = np.zeros((F, 3), dtype=np.float64)
+        fp[:, 0] = flower_centers[:, 0]
+        fp[:, 1] = flower_centers[:, 1]
+        # Vectorized: (B, S, 3) vs (F, 3) -> (B, F, S)
+        # dx[b,f,s] = fp[f,0] - pts[b,s,0]
+        dx = fp[np.newaxis, :, np.newaxis, 0] - pts[:, np.newaxis, :, 0]  # (B,F,S)
+        dy = fp[np.newaxis, :, np.newaxis, 1] - pts[:, np.newaxis, :, 1]  # (B,F,S)
+        dz = fp[np.newaxis, :, np.newaxis, 2] - pts[:, np.newaxis, :, 2]  # (B,F,S)
+        dists = np.sqrt(dx*dx + dy*dy + self.lambda_z * dz*dz)  # (B,F,S)
+        return dists.min(axis=2)  # (B, F)
 
     def _mark_reachable_per_bee(self):
-        """Mark which flowers are reachable by each bee with improved detection"""
+        """Mark which flowers are reachable by each bee (VECTORIZED)."""
         B, F = self.num_bees, self.num_flowers
         self.reachable = np.zeros((B, F), dtype=bool)
         thresh = self.harvest_radius + self.reach_margin
 
-        for j, f in enumerate(self.flowers):
-            cx, cy = f.center_xy
-            for i, b in enumerate(self.bees):
-                # Use both current position and orbit minimum for reachability
-                current_dx = b.fx - cx
-                current_dy = b.fy - cy
-                current_dz = b.fz
-                current_dist = math.sqrt(
-                    current_dx * current_dx
-                    + current_dy * current_dy
-                    + self.lambda_z * current_dz * current_dz
-                )
+        # Current position distances: (B, F)
+        bee_pos = np.array([[b.fx, b.fy, b.fz] for b in self.bees], dtype=np.float64)  # (B,3)
+        flower_centers = np.array([f.center_xy for f in self.flowers], dtype=np.float64)  # (F,2)
+        dx = bee_pos[:, np.newaxis, 0] - flower_centers[np.newaxis, :, 0]  # (B,F)
+        dy = bee_pos[:, np.newaxis, 1] - flower_centers[np.newaxis, :, 1]  # (B,F)
+        dz = bee_pos[:, np.newaxis, 2]  # (B,1) broadcast to (B,F)
+        current_dist = np.sqrt(dx*dx + dy*dy + self.lambda_z * dz*dz)  # (B,F)
 
-                orbit_min_dist = self._min_distance_to_orbit(b, cx, cy)
+        # Orbit minimum distances: (B, F) — fully vectorized
+        self._precompute_orbit_points()
+        orbit_min_dist = self._min_distance_to_orbit_batch(flower_centers)  # (B,F)
 
-                # Consider reachable if either current position or orbit path is within range
-                self.reachable[i, j] = (current_dist <= thresh) or (orbit_min_dist <= thresh)
+        self.reachable = (current_dist <= thresh) | (orbit_min_dist <= thresh)
 
     def _debug_harvest_conditions(self, bee, flower_id):
         """Debug helper to see why harvest might fail"""
@@ -1574,7 +1586,12 @@ class BeeForagingEnv(ParallelEnv):
             if orphan:
                 cx, cy = f.center_xy
                 try:
-                    min_dist = min([self._min_distance_to_orbit(b, cx, cy) for b in self.bees])
+                    if hasattr(self, '_cached_orbit_points') and self._cached_orbit_points is not None:
+                        fc = np.array([[cx, cy]], dtype=np.float64)
+                        all_dists = self._min_distance_to_orbit_batch(fc)  # (B,1)
+                        min_dist = float(all_dists.min())
+                    else:
+                        min_dist = min([self._min_distance_to_orbit(b, cx, cy) for b in self.bees])
                 except Exception:
                     min_dist = float("inf")
                 reachable_any = bool(self.reachable[:, j].any())
@@ -1764,9 +1781,9 @@ class BeeForagingEnv(ParallelEnv):
                 silent_by_heartbeat = (
                     self.steps - self._last_broadcast_step[f.assigned_bee]
                 ) >= timeout
-                recharging = self._recharge_until[f.assigned_bee] > self.steps
+                # Note: recharging bees come back in ~40 steps, NOT orphaned
                 cannot_reach = not bool(self.reachable[f.assigned_bee, flower_idx])
-                if silent_by_idle or silent_by_heartbeat or recharging or cannot_reach:
+                if silent_by_idle or silent_by_heartbeat or cannot_reach:
                     orphan = True
 
             if not orphan:
@@ -1786,6 +1803,14 @@ class BeeForagingEnv(ParallelEnv):
                     pass
 
             if winner_bee_id is not None:
+                # Clean up old owner's assignment lists
+                old_owner = f.assigned_bee
+                if old_owner is not None and old_owner != winner_bee_id:
+                    if old_owner in self.assignments and flower_idx in self.assignments[old_owner]:
+                        self.assignments[old_owner].remove(flower_idx)
+                    if flower_idx in self.bees[old_owner].assigned_flowers:
+                        self.bees[old_owner].assigned_flowers.remove(flower_idx)
+
                 # Assign flower to winner
                 f.assigned_bee = winner_bee_id
                 if winner_bee_id not in self.assignments:
@@ -1800,199 +1825,158 @@ class BeeForagingEnv(ParallelEnv):
         for bee in self.bees:
             bee.retask_board = [t for t in bee.retask_board if t["flower_id"] != flower_id]
 
-    # ---------- Per-bee retask board propagation (v2) ----------
+    # ---------- Per-bee chain relay (v3) ----------
     def _propagate_retask_board(self):
         """
-        Enhanced task propagation via communication chain between nearby bees.
+        Chain relay: each bee with tasks on its board evaluates them.
+        - ACCEPT: task removed from board, flower assigned to this bee.
+          Bee is then LOCKED (can't claim from board again until a NEW
+          traveling board arrives to refresh it).
+        - REJECT: task stays on board for handoff to nearest unseen bee.
         
-        DECISION LOGIC:
-        Each bee evaluates incoming tasks based on:
-        1. Can it reach the flower (orbit reachability)?
-        2. Does it have capacity for the pollen?
-        3. Can it meet the deadline (time window)?
-        4. Is it worth taking given current workload vs priority?
-        
-        If a bee CAN'T accept a task, it holds it until close to another active bee,
-        then passes the task along. This continues until:
-        - A bee accepts the task, OR
-        - The task expires (deadline missed), OR
-        - The episode ends
+        One hop per step: after evaluation, rejected tasks pass to the
+        nearest active bee that hasn't seen them yet (tracked via seen_by).
         """
-        comm_threshold = self.harvest_radius * 2.0  # bees within this distance can communicate
-        
         for i, bee in enumerate(self.bees):
             if not bee.retask_board or bee.truncated:
                 continue
             if self._recharge_until[i] > self.steps:
-                continue  # Recharging bees don't process retask board
-            
-            # Filter out stale tasks (older than 100 steps) or expired deadlines
+                continue  # Recharging bees don't process boards
+
+            # ---- Filter stale / harvested / expired tasks ----
             valid_tasks = []
             for t in bee.retask_board:
-                if self.steps - t["received_step"] >= 100:
-                    continue  # Too old
                 fj = t["flower_id"]
                 if fj >= len(self.flowers):
                     continue
                 f = self.flowers[fj]
                 if f.harvested:
                     continue
-                # Check if deadline permanently missed (HARD window)
                 if f.window_type == "HARD" and self.steps > f.window_end:
-                    continue  # Deadline missed, discard task
+                    continue
+                # Drop tasks older than 200 steps (stale)
+                if self.steps - t.get("received_step", 0) >= 200:
+                    continue
                 valid_tasks.append(t)
             bee.retask_board = valid_tasks
-            
-            # Try to perform tasks from retask board
-            tasks_accepted = []
-            tasks_to_handoff = []
-            
+
+            if not bee.retask_board:
+                continue
+
+            # ---- Evaluate: accept or reject each task ----
+            tasks_accepted_idx = []
+            tasks_to_pass = []
+
             for task_idx, task in enumerate(bee.retask_board):
+                # Ensure seen_by exists
+                if "seen_by" not in task:
+                    task["seen_by"] = set()
+
+                # If this bee already saw this task, skip (can't claim again)
+                if i in task["seen_by"]:
+                    tasks_to_pass.append(task_idx)
+                    continue
+
+                # Mark this bee as having seen the task
+                task["seen_by"].add(i)
+
                 fj = task["flower_id"]
                 f = self.flowers[fj]
                 cx, cy = f.center_xy
-                
-                # ========== DECISION CRITERIA ==========
-                
-                # 1. REACHABILITY: Can this bee's orbit reach the flower?
+
+                # 1. REACHABILITY
                 orbit_dist = self._min_distance_to_orbit(bee, cx, cy)
                 can_reach = orbit_dist <= (self.harvest_radius + self.reach_margin)
-                
-                # 2. CAPACITY: Does bee have room for pollen?
+
+                # 2. CAPACITY
                 can_fit = (bee.load + f.pollen) <= bee.capacity + 1e-9
-                
-                # 3. DEADLINE: Can bee reach flower before deadline?
+
+                # 3. DEADLINE
                 can_meet_deadline = True
-                time_to_window = f.time_until_next_window(self.steps)
                 if f.window_type == "HARD":
-                    # Estimate steps to reach flower (rough approximation)
                     steps_remaining = f.window_end - self.steps
-                    # Conservative: assume bee needs ~10 steps minimum to get there
                     if steps_remaining < 10:
                         can_meet_deadline = False
-                    elif time_to_window < 0:  # Window already missed
-                        can_meet_deadline = False
-                
-                # 4. WORKLOAD vs PRIORITY: Should bee take on more work?
-                # Compute a score: high priority + urgent deadline = should accept
-                priority_score = task.get("priority", f.priority)
-                urgency_score = 0.0
-                if f.window_type == "HARD" and f.window_end > self.steps:
-                    # Higher urgency as deadline approaches
-                    urgency_score = 1.0 - (f.window_end - self.steps) / self.max_steps
-                
-                task_score = priority_score + urgency_score * 2.0  # Weight urgency higher
-                
-                # Current workload: how many pending flowers does bee have?
-                current_workload = len([
-                    fk for fk in bee.assigned_flowers 
+
+                # 4. WORKLOAD
+                current_workload = sum(
+                    1 for fk in bee.assigned_flowers
                     if fk < len(self.flowers) and not self.flowers[fk].harvested
-                ])
-                
-                # Accept if: can reach, can fit, can meet deadline, AND
-                # (workload is low OR task is high-priority/urgent)
-                workload_ok = current_workload < 5  # Max 5 pending tasks
-                priority_ok = task_score >= 1.0  # Accept high-priority regardless
-                
-                should_accept = can_reach and can_fit and can_meet_deadline and (workload_ok or priority_ok)
-                
+                )
+                workload_ok = current_workload < 5
+
+                should_accept = can_reach and can_fit and can_meet_deadline and workload_ok
+
                 if should_accept:
-                    # ACCEPT: This bee claims the task
+                    # ACCEPT: assign flower to this bee, remove from board
                     f.assigned_bee = i
                     if fj not in bee.assigned_flowers:
                         bee.assigned_flowers.append(fj)
-                        # Clear this task from ALL bees' retask boards to prevent duplicates
-                        self._clear_task_from_all_boards(fj)
-                        if self.verbose:
-                            print(
-                                f"[COMM] Bee {i} ACCEPTS task (flower {fj}) "
-                                f"[priority={priority_score:.1f}, urgency={urgency_score:.1f}, "
-                                f"hops={task['hops']}, src_bee={task['source_bee']}]"
-                            )
-                    tasks_accepted.append(task_idx)
+                    if i not in self.assignments:
+                        self.assignments[i] = []
+                    if fj not in self.assignments[i]:
+                        self.assignments[i].append(fj)
+                    # Clear from ALL bees' boards (it's been claimed)
+                    self._clear_task_from_all_boards(fj)
+                    tasks_accepted_idx.append(task_idx)
+                    if self.verbose:
+                        print(
+                            f"[CHAIN] Bee {i} ACCEPTS flower {fj} "
+                            f"(hops={task['hops']}, src={task['source_bee']})"
+                        )
                 else:
-                    # REJECT: Cannot or should not accept - mark for handoff
-                    reason = []
-                    if not can_reach:
-                        reason.append("unreachable")
-                    if not can_fit:
-                        reason.append("no_capacity")
-                    if not can_meet_deadline:
-                        reason.append("deadline_miss")
-                    if not workload_ok and not priority_ok:
-                        reason.append("overloaded")
-                    
-                    task["reject_reason"] = ",".join(reason)
-                    tasks_to_handoff.append(task_idx)
-                    bee.awaiting_handoff = True
-            
-            # Remove accepted tasks from board
-            for idx in sorted(tasks_accepted, reverse=True):
+                    tasks_to_pass.append(task_idx)
+
+            # ---- Remove accepted tasks (already cleared by _clear_task_from_all_boards) ----
+            # Rebuild board with only tasks to pass
+            remaining = []
+            for idx in tasks_to_pass:
                 if idx < len(bee.retask_board):
-                    bee.retask_board.pop(idx)
-            
-            # ========== HANDOFF TO NEARBY BEE ==========
-            if bee.awaiting_handoff and tasks_to_handoff:
-                # Find nearest active bee to pass tasks to
-                nearest_bee_id = None
-                min_dist = float("inf")
-                
-                for j in range(self.num_bees):
-                    if i == j:
-                        continue
-                    other = self.bees[j]
-                    if other.truncated or self._recharge_until[j] > self.steps:
-                        continue
-                    
-                    dx = other.fx - bee.fx
-                    dy = other.fy - bee.fy
-                    dz = other.fz - bee.fz
-                    dist = math.sqrt(dx * dx + dy * dy + self.lambda_z * dz * dz)
-                    
-                    if dist < comm_threshold and dist < min_dist:
-                        min_dist = dist
-                        nearest_bee_id = j
-                
-                # If found nearby bee, handoff tasks
-                if nearest_bee_id is not None:
-                    tasks_passed = 0
-                    last_task = None
-                    target_bee = self.bees[nearest_bee_id]
-                    existing_in_board = {t["flower_id"] for t in target_bee.retask_board}
-                    for idx in sorted(tasks_to_handoff, reverse=True):
-                        if idx < len(bee.retask_board):
-                            task = bee.retask_board.pop(idx)
-                            fj = task["flower_id"]
-                            # Skip if target already has this task or flower is harvested
-                            if fj in existing_in_board:
-                                continue
-                            if fj < len(self.flowers) and self.flowers[fj].harvested:
-                                continue
+                    remaining.append(bee.retask_board[idx])
+
+            # ---- Handoff remaining tasks to nearest UNSEEN active bee ----
+            if remaining:
+                # For each remaining task, find nearest bee not in seen_by
+                tasks_still_here = []
+                for task in remaining:
+                    seen = task.get("seen_by", set())
+                    nearest_id = None
+                    min_d = float("inf")
+                    for j in range(self.num_bees):
+                        if j == i or j in seen:
+                            continue
+                        other = self.bees[j]
+                        if other.truncated or self._recharge_until[j] > self.steps:
+                            continue
+                        dx2 = other.fx - bee.fx
+                        dy2 = other.fy - bee.fy
+                        dz2 = other.fz - bee.fz
+                        d = math.sqrt(dx2*dx2 + dy2*dy2 + self.lambda_z*dz2*dz2)
+                        if d < min_d:
+                            min_d = d
+                            nearest_id = j
+
+                    if nearest_id is not None:
+                        target = self.bees[nearest_id]
+                        existing = {t["flower_id"] for t in target.retask_board}
+                        fj = task["flower_id"]
+                        if fj not in existing:
                             task["hops"] += 1
                             task["received_step"] = self.steps
-                            # Preserve flower metadata for next bee's decision
-                            if fj < len(self.flowers):
-                                f = self.flowers[fj]
-                                task["priority"] = f.priority
-                                task["window_type"] = f.window_type
-                                task["window_end"] = f.window_end
-                                task["pollen"] = f.pollen
-                            target_bee.retask_board.append(task)
-                            existing_in_board.add(fj)
-                            tasks_passed += 1
-                            last_task = task
-                    
-                    if tasks_passed > 0:
-                        self.bees[nearest_bee_id].last_received_from = i
-                        bee.last_broadcast_to = nearest_bee_id
-                        if self.verbose:
-                            print(
-                                f"[COMM] Bee {i} → Bee {nearest_bee_id}: passed {tasks_passed} tasks "
-                                f"(dist: {min_dist:.2f}, hops: {last_task['hops'] if last_task else 0})"
-                            )
-                    
-                    bee.awaiting_handoff = False
-                # else: Keep tasks on this bee's board until a nearby bee is found
+                            target.retask_board.append(task)
+                            if self.verbose:
+                                print(
+                                    f"[CHAIN] Bee {i} \u2192 Bee {nearest_id}: "
+                                    f"passed flower {fj} (hops={task['hops']})"
+                                )
+                    else:
+                        # All bees have seen this task — cycle complete, keep on board
+                        # (it will expire via staleness check next cycle)
+                        tasks_still_here.append(task)
+
+                bee.retask_board = tasks_still_here
+            else:
+                bee.retask_board = []
 
     # ---------- Re-task helper ----------
     def _retask_silent_bees(self):

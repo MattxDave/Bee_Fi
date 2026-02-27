@@ -26,6 +26,7 @@ class Actor(nn.Module):
         # --- Feature Encoders ---
         self.position_fc = nn.Sequential(nn.Linear(3, 64), nn.LayerNorm(64), nn.ReLU())
         self.status_fc = nn.Sequential(nn.Linear(2, 32), nn.LayerNorm(32), nn.ReLU())
+        self.battery_fc = nn.Sequential(nn.Linear(2, 32), nn.LayerNorm(32), nn.ReLU())
         self.step_fc = nn.Sequential(nn.Linear(1, 32), nn.LayerNorm(32), nn.ReLU())
         self.cons_fc = nn.Sequential(nn.Linear(num_bees, 64), nn.LayerNorm(64), nn.ReLU())
         self.action_availability_fc = nn.Sequential(nn.Linear(3, 32), nn.LayerNorm(32), nn.ReLU())
@@ -65,8 +66,8 @@ class Actor(nn.Module):
             retask_board_dim = 128
 
         # Calculate input dimension properly
-        # The 256 from the old flower_fc is now self.flower_embed_dim
-        trunk_input = 64 + 32 + self.flower_embed_dim + 32 + 64 + retask_board_dim + 32
+        # pos(64) + status(32) + battery(32) + flowers(128) + step(32) + consensus(64) + retask(128) + action_avail(32)
+        trunk_input = 64 + 32 + 32 + self.flower_embed_dim + 32 + 64 + retask_board_dim + 32
 
         self.trunk = nn.Sequential(
             nn.Linear(trunk_input, hidden_dim),
@@ -102,6 +103,7 @@ class Actor(nn.Module):
         # Normalize inputs for stability
         position = ensure2d(obs_dict["position"]) / self.grid_size  # grid size normalization
         status = ensure2d(obs_dict["status"])
+        battery = ensure2d(obs_dict.get("battery", torch.zeros(1, 2, device=position.device)))
 
         # --- NEW: Flower Attention Logic ---
         flowers = ensure2d(obs_dict["flowers"])
@@ -146,6 +148,7 @@ class Actor(nn.Module):
         # Forward pass with normalized inputs
         pos_out = self.position_fc(position)
         sta_out = self.status_fc(status)
+        bat_out = self.battery_fc(battery)
         # flw_out is now the (B, 128) vector from the transformer
         stp_out = self.step_fc(step_count)
         con_out = self.cons_fc(consensus)
@@ -173,7 +176,7 @@ class Actor(nn.Module):
                 aa_out = torch.zeros(
                     pos_out.shape[0], 32, device=pos_out.device, dtype=pos_out.dtype
                 )
-            h = torch.cat([pos_out, sta_out, flw_out, stp_out, con_out, rtb_out, aa_out], dim=-1)
+            h = torch.cat([pos_out, sta_out, bat_out, flw_out, stp_out, con_out, rtb_out, aa_out], dim=-1)
         else:
             act_avail = (
                 ensure2d(obs_dict.get("action_availability", None))
@@ -186,7 +189,7 @@ class Actor(nn.Module):
                 aa_out = torch.zeros(
                     pos_out.shape[0], 32, device=pos_out.device, dtype=pos_out.dtype
                 )
-            h = torch.cat([pos_out, sta_out, flw_out, stp_out, con_out, aa_out], dim=-1)
+            h = torch.cat([pos_out, sta_out, bat_out, flw_out, stp_out, con_out, aa_out], dim=-1)
 
         h = self.trunk(h)
 

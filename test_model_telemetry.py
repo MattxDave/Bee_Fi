@@ -15,10 +15,11 @@ import json
 import numpy as np
 import torch
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import List, Optional
 
 from bees_env import BeeForagingEnv
-from telemetry_mapper import load_telemetry, TelemetryMapper
+from bee_policy import Actor
+from train_orbital_v2 import obs_to_tensor
 
 
 class TelemetryModelTester:
@@ -74,43 +75,33 @@ class TelemetryModelTester:
         
         return env
     
-    def load_model(self, env: BeeForagingEnv) -> bool:
-        """Load trained model if available."""
-        if self.model_path is None:
-            # Search for model files
-            model_candidates = [
-                "outputs/best_actor.pt",
-                "outputs/best_critic.pt",
-                "models/best_model.zip",
-                "models/ppo_bees.zip",
-                "checkpoints/latest.pt",
-            ]
-            for candidate in model_candidates:
-                if os.path.exists(candidate):
-                    self.model_path = candidate
-                    break
-        
-        if self.model_path and os.path.exists(self.model_path):
-            if self.verbose:
-                print(f"Loading model from: {self.model_path}")
-            
-            try:
-                # Try loading as PyTorch model
-                if self.model_path.endswith(".pt"):
-                    self.model = torch.load(self.model_path, map_location=self.device)
-                    self.model_type = "pytorch"
-                    if self.verbose:
-                        print(f"  Loaded PyTorch model")
-                    return True
-            except Exception as e:
-                if self.verbose:
-                    print(f"  Could not load model: {e}")
-        
-        if self.verbose:
-            print("No trained model found. Using random policy for baseline.")
-        self.model = None
-        self.model_type = "random"
-        return False
+    def load_model(self, model_path):
+        """Load the trained model from the specified path"""
+        # Infer model shape from checkpoint
+        state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+        # Infer num_bees from consensus layer weight shape
+        num_bees = state_dict.get('cons_fc.0.weight', torch.zeros(64, 5)).shape[1]
+        # Infer num_flowers from flower transformer input
+        num_flowers = state_dict.get('flowers_fc.0.weight', torch.zeros(128, 12)).shape[0] // 128 * 12
+        # Check for retask board
+        has_retask = 'retask_board_fc.0.weight' in state_dict
+        retask_size = 0
+        if has_retask:
+            retask_input = state_dict['retask_board_fc.0.weight'].shape[1]
+            retask_size = retask_input // 5
+        # Infer hidden_dim from trunk
+        hidden_dim = state_dict.get('trunk.0.weight', torch.zeros(256, 480)).shape[0]
+
+        self.model = Actor(
+            num_bees=num_bees,
+            num_flowers=num_flowers // 12 if num_flowers > 12 else num_flowers,
+            hidden_dim=hidden_dim,
+            retask_board_size=retask_size,
+        )
+        self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
+        self.model.eval()
+        self.model_type = "pytorch"
     
     def get_actions(self, env: BeeForagingEnv, obs: dict) -> dict:
         """Get actions from model or random policy."""
@@ -134,15 +125,13 @@ class TelemetryModelTester:
                         else:
                             obs_tensor = torch.FloatTensor(agent_obs).unsqueeze(0).to(self.device)
                         
-                        # Get action from model
-                        if hasattr(self.model, 'forward'):
-                            action_probs = self.model(obs_tensor)
-                            if isinstance(action_probs, tuple):
-                                action_probs = action_probs[0]
-                            action = torch.argmax(action_probs, dim=-1).item()
-                        else:
-                            # Fallback to random
-                            action = np.random.randint(0, 3)
+                        # Convert per-agent observation dict to Actor input
+                        if isinstance(agent_obs, dict):
+                            obs_tensor = obs_to_tensor(agent_obs, self.device)
+                        
+                        # Get action logits from model
+                        action_logits = self.model(obs_tensor)
+                        action = torch.argmax(action_logits, dim=-1).squeeze(0).cpu().item()
                         
                         actions[agent_name] = action
             except Exception as e:

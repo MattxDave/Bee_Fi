@@ -390,7 +390,8 @@ class TelemetryMapper:
         if hasattr(bee, "e"):
             bee.e = eccentricity
         if hasattr(bee, "i"):
-            bee.i = math.radians(inclination) if inclination < 10 else inclination
+            # Convert inclination to radians
+            bee.i = math.radians(inclination)
 
         # Set termination status
         bee.terminated = terminated

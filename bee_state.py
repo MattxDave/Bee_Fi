@@ -39,8 +39,8 @@ class Bee:
         # ---- Kepler (two-body) defaults ----
         self.a_units = grid_size * float(orbit_scale)  # semi-major axis in GRID UNITS
         self.a = self.a_units
-        self.e = 0.25 + 0.05 * bee_id
-        self.i = math.radians(10 + 12 * bee_id)
+        self.e = min(0.25 + 0.02 * bee_id, 0.85)  # Cap eccentricity < 1 for elliptical orbits
+        self.i = math.radians(10 + (170 / max(1, bee_id + 1)) * (bee_id % 15))  # Spread inclinations evenly
         self.Omega = math.radians((31 * bee_id) % 360)
         self.omega = math.radians((57 * bee_id) % 360)
 

@@ -6,36 +6,28 @@ Extracts performance metrics from saved checkpoints and generates training curve
 
 import os
 import json
+import re
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from collections import defaultdict
 
 from bees_env import BeeForagingEnv
 from bee_policy import Actor
 
 
-def get_checkpoint_dirs():
-    """Find all checkpoint directories."""
-    checkpoints = []
-    
-    # Look for upd* directories
-    for item in os.listdir('.'):
-        if os.path.isdir(item):
-            if item.startswith('upd') and os.path.exists(f'{item}/outputs_actor.pt'):
-                try:
-                    update_num = int(item.replace('upd', ''))
-                    checkpoints.append((update_num, item))
-                except ValueError:
-                    pass
-            elif item == 'best' and os.path.exists(f'{item}/outputs_actor.pt'):
-                checkpoints.append((-1, item))  # Special marker for best
-            elif item == 'final' and os.path.exists(f'{item}/outputs_actor.pt'):
-                checkpoints.append((999999, item))  # Special marker for final
-    
-    # Sort by update number
-    checkpoints.sort(key=lambda x: x[0])
-    return checkpoints
+def get_checkpoint_dirs(output_path):
+    """Scan for checkpoint directories"""
+    checkpoint_dirs = []
+    # Look for both flat PPO and HRL checkpoints
+    for root, dirs, files in os.walk(output_path):
+        # Flat PPO checkpoints
+        if any(f.endswith('_actor.pt') for f in files):
+            checkpoint_dirs.append(root)
+        # HRL checkpoints
+        elif 'manager.pt' in files and 'worker.pt' in files:
+            checkpoint_dirs.append(root)
+    return sorted(checkpoint_dirs, key=lambda x: int(re.search(r'upd(\d+)', x).group(1)) if 'upd' in x else 0)
 
 
 def load_actor(model_path, num_bees=5, action_dim=3, hidden_dim=256, num_flowers=12, retask_board_size=2):
@@ -136,7 +128,7 @@ def generate_training_curves(num_episodes=20, save_path='training_curves.json'):
     env.reset()
     
     # Find checkpoints
-    checkpoints = get_checkpoint_dirs()
+    checkpoints = get_checkpoint_dirs('.')
     print(f"Found {len(checkpoints)} checkpoints")
     
     # Evaluate each checkpoint
@@ -158,8 +150,12 @@ def generate_training_curves(num_episodes=20, save_path='training_curves.json'):
     for update_num, checkpoint_dir in checkpoints:
         print(f"\nEvaluating checkpoint: {checkpoint_dir} (update {update_num})")
         
-        # Load actor
-        model_path = f'{checkpoint_dir}/outputs_actor.pt'
+        # Load actor - check for both PPO and HRL checkpoint formats
+        actor_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('_actor.pt')]
+        if actor_files:
+            model_path = os.path.join(checkpoint_dir, actor_files[0])
+        else:
+            model_path = os.path.join(checkpoint_dir, 'outputs_actor.pt')
         try:
             actor = load_actor(model_path, num_bees=5)
         except Exception as e:

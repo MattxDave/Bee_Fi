@@ -8,35 +8,35 @@
 # --------------------------
 env:
   # Swarm Configuration
-  num_bees: 15             # Number of bees in the swarm (agents)
-  num_flowers: 30          # Number of flowers (tasks) to harvest
-  grid_size: 50            # Size of the 2D world (grid_size x grid_size)
+  num_bees: 25             # Number of bees in the swarm (agents)
+  num_flowers: 50          # Number of flowers (tasks) to harvest
+  grid_size: 75            # Size of the 2D world (grid_size x grid_size)
   
   # Episode Settings
-  max_steps: 800           # Maximum steps per episode
+  max_steps: 1200          # Maximum steps per episode (enough for full battery cycling)
   
   # Harvesting
-  harvest_radius: 18.0      # Euclidean distance from current bee position to flower
-  reach_margin: 3.0         # Extra margin for orbit-based reachability checks
+  harvest_radius: 27.0      # Euclidean distance from current bee position to flower (scaled with grid)
+  reach_margin: 4.5         # Extra margin for orbit-based reachability checks
   lambda_z: 0.5            # Weight of z-axis in 3D distance calculations
   
   # Orbital Motion
   orbit_scale: 0.8         # Scale of orbital paths (relative to grid)
   
   # Time Windows (for flowers)
-  time_window_min: 10      # Earliest step a time window can start
-  time_window_max: 80      # Latest step a time window can start
+  time_window_min: 15      # Earliest step a time window can start
+  time_window_max: 120     # Latest step a time window can start
   
   # Battery/Energy
-  battery_min_steps: 300   # Minimum battery capacity (in steps)
-  battery_max_steps: 500   # Maximum battery capacity (in steps)
-  recharge_steps: 30       # Steps needed to recharge
+  battery_min_steps: 450   # Minimum battery capacity (in steps, scaled)
+  battery_max_steps: 750   # Maximum battery capacity (in steps, scaled)
+  recharge_steps: 40       # Steps needed to recharge
   drain_per_step: 1.0      # Battery drain per step
-  low_battery_chance: 0.05  # Probability of low-battery training episode (keep low early)
+  low_battery_chance: 0.05  # Probability of low-battery training episode
   
   # Retasking (task passing between bees)
-  retask_board_size: 2     # Size of per-bee retask board (MUST match trained model!)
-  retask_timeout_steps: 30 # Steps before a bee is considered "silent"
+  retask_board_size: 3     # Size of per-bee retask board (more bees = more tasks to pass)
+  retask_timeout_steps: 40 # Steps before a bee is considered "silent"
   
   # Reward Shaping
   shaping_weight: 0.05     # Weight of distance-based reward shaping
@@ -54,12 +54,12 @@ train:
   
   # PPO Hyperparameters
   num_updates: 5000        # Maximum training updates (will stop early if converged)
-  rollout_len: 512         # Steps per rollout before PPO update (longer for orbital timing)
+  rollout_len: 768         # Steps per rollout before PPO update
   gamma: 0.99              # Discount factor
   lam: 0.95                # GAE lambda
   clip_ratio: 0.2          # PPO clipping ratio
   value_coef: 0.5          # Value loss coefficient
-  entropy_coef: 0.01       # Entropy bonus coefficient
+  entropy_coef: 0.02       # Entropy bonus (higher = more exploration early)
   
   # Learning Rates
   lr_actor: 0.0003         # Actor learning rate
@@ -67,11 +67,11 @@ train:
   
   # Mini-batch Training
   num_epochs: 2            # PPO epochs per update
-  minibatch_size: 64       # Mini-batch size
+  minibatch_size: 128      # Mini-batch size (larger for more agents)
   
   # Early Stopping (prevents overtraining)
   early_stopping: true     # Enable early stopping
-  patience: 200            # Stop if no improvement for this many updates
+  patience: 1000           # Stop if no improvement for this many updates
   min_harvest_rate: 0.95   # Target: 95% flowers harvested to consider "good"
   convergence_window: 50   # Check performance over this many episodes
 

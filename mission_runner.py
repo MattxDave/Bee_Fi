@@ -26,10 +26,8 @@ import json
 import math
 import os
 import glob
-import numpy as np
 import torch
 from datetime import datetime
-from typing import Optional
 
 from bees_env import BeeForagingEnv
 from bee_policy import Actor
@@ -68,7 +66,8 @@ def apply_bee_config(env: BeeForagingEnv, bees_config: list[dict]):
             bee.i = math.radians(b_cfg["inclination_deg"])
             bee.omega = math.radians(b_cfg["omega_deg"])
             bee.Omega = math.radians(b_cfg["Omega_deg"])
-            bee.nu = math.radians(b_cfg["true_anomaly_deg"])
+            # Initialize bee - use mean anomaly (M) instead of true anomaly (nu)
+            bee.M = random.uniform(0, 2 * math.pi)  # Set mean anomaly directly
             # Update position based on new orbital params
             bee.update_position()
             # Apply battery capacity

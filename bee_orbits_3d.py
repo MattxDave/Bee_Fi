@@ -217,107 +217,37 @@ def adapt_flowers_vec(
 AC_MAP = {0: "DONOTHING", 1: "HARVEST", 2: "GROOM"}
 
 
-def choose_actions(actor, obs_dicts, stochastic: bool, trained_nflowers: int):
+def choose_actions(actor, obs_dicts, stochastic: bool, trained_nflowers: int, num_bees: int = 25, device: str = "cpu"):
+    """Batched action selection matching training pipeline exactly."""
+    import torch.nn.functional as F
+    from train_orbital_v2 import _batch_obs_to_tensor
+
     actions = {}
-    claims = {}
+    claims = {agent: None for agent in obs_dicts}
+
     with torch.no_grad():
-        for agent, ob in obs_dicts.items():
-            ob_tensor = {
-                "position": torch.tensor(ob["position"], dtype=torch.float32).unsqueeze(0),
-                "status": torch.tensor(ob["status"], dtype=torch.float32).unsqueeze(0),
-                "flowers": torch.tensor(ob["flowers"], dtype=torch.float32).unsqueeze(0),
-                "step_count": torch.tensor(ob["step_count"], dtype=torch.float32).unsqueeze(0),
-                "consensus": torch.tensor(ob["consensus"], dtype=torch.float32).unsqueeze(0),
-            }
-            # Include optional features if present
-            if "action_availability" in ob:
-                ob_tensor["action_availability"] = torch.tensor(
-                    ob["action_availability"], dtype=torch.float32
-                ).unsqueeze(0)
-            if "retask_board" in ob:
-                ob_tensor["retask_board"] = torch.tensor(
-                    ob["retask_board"], dtype=torch.float32
-                ).unsqueeze(0)
-            for k in ob_tensor:
-                ob_tensor[k] = torch.nan_to_num(ob_tensor[k], nan=0.0, posinf=0.0, neginf=0.0)
+        batched = _batch_obs_to_tensor(obs_dicts, num_bees, device)
+        logits = actor(batched)  # (num_bees, action_dim)
 
-            # *** critical: adapt flowers to trained size ***
-            ob_tensor["flowers"] = adapt_flowers_vec(
-                ob_tensor["flowers"], trained_nflowers, stride=9
-            )
+        # Apply action masking (same as training)
+        if "action_availability" in batched:
+            avail = batched["action_availability"]  # (num_bees, 3)
+            # Reorder: [can_harvest, can_groom, can_do_nothing] -> [donothing, harvest, groom]
+            mask = torch.stack([avail[:, 2], avail[:, 0], avail[:, 1]], dim=-1)
+            logits = logits + (mask - 1.0) * 1e8
 
-            # Try to get claim logits if actor supports it
-            claim_logits = None
-            try:
-                out = actor(ob_tensor, return_claims=True)
-            except TypeError:
-                # older actor signature
-                out = actor(ob_tensor)
-            # Unpack outputs
-            if isinstance(out, (tuple, list)) and len(out) >= 1:
-                logits = out[0]
-                if len(out) >= 2:
-                    claim_logits = out[1]
-            else:
-                logits = out
+        probs = F.softmax(logits, dim=-1)
 
-            # Apply action mask (same logic as training)
-            if "action_availability" in ob:
-                avail = ob["action_availability"]
-                if avail is not None and len(avail) == 3:
-                    action_mask = torch.ones(logits.shape[-1], dtype=torch.bool)
-                    action_mask[0] = bool(avail[2] >= 0.5)  # DONOTHING
-                    action_mask[1] = bool(avail[0] >= 0.5)  # HARVEST
-                    action_mask[2] = bool(avail[1] >= 0.5)  # GROOM
+        if stochastic:
+            dist = torch.distributions.Categorical(probs)
+            actions_t = dist.sample()  # (num_bees,)
+        else:
+            actions_t = torch.argmax(probs, dim=-1)
 
-                    if not action_mask.any():
-                        action_mask[0] = True  # Fallback to DONOTHING
+        for agent in obs_dicts:
+            idx = int(agent.split("_")[1])
+            actions[agent] = int(actions_t[idx].item())
 
-                    # Mask logits
-                    if not action_mask.all():
-                        logits = logits.clone()
-                        logits[0, ~action_mask] = float("-inf")
-
-            # Action selection
-            if stochastic:
-                dist = torch.distributions.Categorical(logits=logits)
-                a = dist.sample().item()
-            else:
-                a = torch.argmax(torch.softmax(logits, dim=-1), dim=-1).item()
-            actions[agent] = int(a)
-
-            # Claim selection (if available)
-            if claim_logits is not None:
-                try:
-                    # ensure cpu numpy
-                    cl = claim_logits.squeeze(0)
-                    if stochastic:
-                        cdist = torch.distributions.Categorical(logits=cl)
-                        csel = int(cdist.sample().item())
-                    else:
-                        csel = int(torch.argmax(torch.softmax(cl, dim=-1)).item())
-
-                    # determine board size: prefer actor attr, fallback to vector length in obs
-                    M = getattr(actor, "retask_board_size", None)
-                    if M is None:
-                        rvec = ob.get("retask_board")
-                        if rvec is not None:
-                            M = int(len(rvec) // 5)
-                        else:
-                            M = 0
-
-                    # last index denotes no-claim when dims == M+1
-                    if M > 0 and csel >= 0:
-                        if csel >= M:
-                            claims[agent] = None
-                        else:
-                            claims[agent] = int(csel)
-                    else:
-                        claims[agent] = None
-                except Exception:
-                    claims[agent] = None
-            else:
-                claims[agent] = None
     return actions, claims
 
 
@@ -341,13 +271,16 @@ def flower_arrays(env, bee_colors):
 
 
 def make_model_with_hidden(
-    ActorCls, CriticCls, num_bees, action_dim, gsize, hidden_dim, num_flowers
+    ActorCls, CriticCls, num_bees, action_dim, gsize, hidden_dim, num_flowers,
+    retask_board_size=0, grid_size=75
 ):
     actor = ActorCls(
-        num_bees=num_bees, action_dim=action_dim, hidden_dim=hidden_dim, num_flowers=num_flowers
+        num_bees=num_bees, action_dim=action_dim, hidden_dim=hidden_dim,
+        num_flowers=num_flowers, retask_board_size=retask_board_size, grid_size=grid_size
     )
     critic = CriticCls(
-        global_state_size=gsize, num_bees=num_bees, action_dim=action_dim, hidden_dim=hidden_dim
+        global_state_size=gsize, num_bees=num_bees, action_dim=action_dim, hidden_dim=hidden_dim,
+        grid_size=grid_size
     )
     return actor, critic
 
@@ -367,6 +300,7 @@ def main():
     # policy controls
     p.add_argument("--policy", action="store_true")
     p.add_argument("--model_tag", type=str, default="best")
+    p.add_argument("--model_dir", type=str, default="", help="Override model directory (default: from config.yaml)")
     p.add_argument("--episodes", type=int, default=1)
     p.add_argument("--stochastic", action="store_true")
     # ---------- SGP4 toggles ----------
@@ -451,6 +385,9 @@ def main():
         out_dir = d.get("output", {}).get(
             "path", d.get("training", {}).get("model_output_path", "output")
         )
+    # CLI override for model directory
+    if args.model_dir:
+        out_dir = args.model_dir
 
     # overlay SGP4 from CLI (optional)
     if args.use_sgp4:
@@ -490,11 +427,14 @@ def main():
                 "retask_board_size",
                 "retask_timeout_steps",
                 "count_idle_as_silent",
+                "battery_min_steps",
+                "battery_max_steps",
+                "recharge_steps",
+                "drain_per_step",
                 "use_sgp4",
                 "sgp4_km_per_unit",
                 "sgp4_time_stagger_s",
                 "tle_lines",
-                "low_battery_chance",
             ]
         },
         low_battery_chance=0.0,  # Disable low-battery episodes for visualization
@@ -523,16 +463,9 @@ def main():
         gsize=gsize,
         hidden_dim=hid,
         num_flowers=trained_nflowers,
+        retask_board_size=rtb_size,
+        grid_size=env.grid_size,
     )
-    # If retask board present, rebuild actor with correct size
-    if rtb_size and getattr(actor, "retask_board_size", 0) != rtb_size:
-        actor = Actor(
-            num_bees=num_bees,
-            action_dim=ACTION_DIM,
-            hidden_dim=hid,
-            num_flowers=trained_nflowers,
-            retask_board_size=rtb_size,
-        )
     try:
         _ = load_models(actor, critic, args.model_tag, out_dir)
     except Exception as e:
@@ -989,7 +922,8 @@ def main():
         def update(_frame_idx):
             nonlocal obs
             actions, claims = choose_actions(
-                actor, obs, stochastic=args.stochastic, trained_nflowers=trained_nflowers
+                actor, obs, stochastic=args.stochastic, trained_nflowers=trained_nflowers,
+                num_bees=num_bees, device="cpu"
             )
             # draw provisional claim arrows (before env resolves)
             for pl in provisional_claim_lines:

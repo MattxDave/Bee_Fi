@@ -16,9 +16,6 @@ Key Features:
 
 import argparse
 import os
-import time
-from pathlib import Path
-from typing import Dict, List
 
 import numpy as np
 import torch
@@ -37,7 +34,6 @@ from hrl_policy import (
     GoalConditionedWorker,
     HRLCritic,
     build_manager_obs,
-    GOAL_NAMES,
 )
 
 
@@ -85,11 +81,64 @@ def _ensure_tensor(x, device="cpu"):
     return torch.tensor(x, dtype=torch.float32, device=device)
 
 
+def _batch_obs_to_tensor(obs: dict, num_bees: int, device: str) -> dict:
+    """Convert all bee observations into a single batched tensor dict.
+    Optimized: single CPU→GPU transfer via one contiguous numpy buffer.
+    """
+    keys = ["position", "status", "battery", "flowers", "step_count", "consensus", "retask_board", "action_availability"]
+    defaults = {
+        "battery": np.zeros(2),
+        "retask_board": np.zeros(15),
+        "action_availability": np.ones(3),
+    }
+    # Determine dims from first bee
+    sample = obs.get("bee_0", {})
+    dims = {}
+    total_dim = 0
+    for key in keys:
+        val = sample.get(key, defaults.get(key, np.zeros(1)))
+        if isinstance(val, (int, float)):
+            dims[key] = 1
+        else:
+            dims[key] = np.asarray(val).ravel().shape[0]
+        total_dim += dims[key]
+
+    # Single contiguous buffer
+    buf = np.zeros((num_bees, total_dim), dtype=np.float32)
+    col = 0
+    slices = {}
+    for key in keys:
+        d = dims[key]
+        slices[key] = (col, col + d)
+        default_val = defaults.get(key)
+        for i in range(num_bees):
+            ob = obs.get(f"bee_{i}", {})
+            val = ob.get(key, default_val)
+            if val is None:
+                pass
+            elif isinstance(val, (int, float)):
+                buf[i, col] = float(val)
+            else:
+                arr = np.asarray(val, dtype=np.float32).ravel()
+                n = min(len(arr), d)
+                buf[i, col:col+n] = arr[:n]
+        col += d
+
+    # Single CPU→GPU transfer
+    buf_t = torch.from_numpy(buf).to(device)
+    batch = {}
+    for key in keys:
+        s, e = slices[key]
+        batch[key] = buf_t[:, s:e]
+    return batch
+
+
 def obs_to_tensor(obs_dict: dict, device: str = "cpu") -> dict:
     """Convert observation dict to tensor dict for actor."""
     return {
         "position": _ensure_tensor(obs_dict["position"], device).unsqueeze(0),
         "status": _ensure_tensor(obs_dict["status"], device).unsqueeze(0),
+        "battery": _ensure_tensor(obs_dict.get("battery", np.zeros(2)), device).unsqueeze(0),
         "flowers": _ensure_tensor(obs_dict["flowers"], device).unsqueeze(0),
         "step_count": _ensure_tensor(obs_dict["step_count"], device).unsqueeze(0),
         "consensus": _ensure_tensor(obs_dict["consensus"], device).unsqueeze(0),
@@ -108,6 +157,7 @@ def obs_to_global_state(obs_dict: dict, num_bees: int, device: str = "cpu") -> t
         features = np.concatenate([
             np.array(ob.get("position", [0, 0, 0]), dtype=np.float32),
             np.array(ob.get("status", [0, 0]), dtype=np.float32),
+            np.array(ob.get("battery", [1.0, 0.0]), dtype=np.float32),
             np.array(ob.get("flowers", np.zeros(72)), dtype=np.float32),
             np.array(ob.get("step_count", [0]), dtype=np.float32),
             np.array(ob.get("consensus", np.zeros(num_bees)), dtype=np.float32),
@@ -131,7 +181,7 @@ def collect_rollout(
 ) -> dict:
     """
     Collect a rollout of `rollout_len` steps and compute GAE advantages.
-    Returns batch dict with observations, actions, rewards, values, advantages, returns.
+    BATCHED: processes all bees in a single forward pass per step.
     """
     obs = env.reset()
     num_bees = len(env.bees)
@@ -145,58 +195,46 @@ def collect_rollout(
     all_dones = []
 
     for step in range(rollout_len):
-        step_obs = {}
-        step_actions = {}
-        step_logprobs = []
+        # Batch all bees into single tensors — ONE forward pass for all bees
+        batched_obs = _batch_obs_to_tensor(obs, num_bees, device)
 
         # Get global state for critic (once per step)
         global_state = obs_to_global_state(obs, num_bees, device)
+        
         with torch.no_grad():
             step_value = critic(global_state).item()
 
-        for i in range(num_bees):
-            agent = f"bee_{i}"
-            ob = obs[agent]
-            ob_tensor = obs_to_tensor(ob, device)
+            # Single batched forward pass for ALL bees
+            action_logits = actor(batched_obs)  # (num_bees, action_dim)
 
-            with torch.no_grad():
-                # Get action logits from actor
-                action_logits = actor(ob_tensor)
-                
-                # Apply action masking if available
-                # NOTE: action_availability = [can_harvest, can_groom, can_do_nothing]
-                # But action space is: 0=DONOTHING, 1=HARVEST, 2=GROOM
-                # So we need to reorder the mask to match action indices
-                if "action_availability" in ob:
-                    avail = ob["action_availability"]
-                    # Reorder: [donothing, harvest, groom] to match action indices
-                    mask = _ensure_tensor([avail[2], avail[0], avail[1]], device)
-                    # Set unavailable actions to very low logits
-                    action_logits = action_logits + (mask - 1.0) * 1e8
-                
-                probs = F.softmax(action_logits, dim=-1)
-                
-                if stochastic:
-                    dist = torch.distributions.Categorical(probs)
-                    action = dist.sample()
-                    logprob = dist.log_prob(action)
-                else:
-                    action = torch.argmax(probs, dim=-1)
-                    logprob = torch.log(probs.gather(-1, action.unsqueeze(-1)) + 1e-8).squeeze(-1)
+            # Apply action masking (batched)
+            if "action_availability" in batched_obs:
+                avail = batched_obs["action_availability"]  # (num_bees, 3)
+                # Reorder: [can_harvest, can_groom, can_do_nothing] -> [donothing, harvest, groom]
+                mask = torch.stack([avail[:, 2], avail[:, 0], avail[:, 1]], dim=-1)
+                action_logits = action_logits + (mask - 1.0) * 1e8
 
-            step_obs[agent] = ob
-            step_actions[agent] = int(action.item())
-            step_logprobs.append(logprob.item())
+            probs = F.softmax(action_logits, dim=-1)  # (num_bees, 3)
 
-        # Step environment
+            if stochastic:
+                dist = torch.distributions.Categorical(probs)
+                actions_t = dist.sample()       # (num_bees,)
+                logprobs_t = dist.log_prob(actions_t)  # (num_bees,)
+            else:
+                actions_t = torch.argmax(probs, dim=-1)
+                logprobs_t = torch.log(probs.gather(-1, actions_t.unsqueeze(-1)) + 1e-8).squeeze(-1)
+
+        # Build action dict for env
+        step_actions = {f"bee_{i}": int(actions_t[i].item()) for i in range(num_bees)}
+
+        # Step environment (chain relay handles retasking internally)
         next_obs, rewards, terminated, truncated, infos, _ = env.step(step_actions)
 
-        # Store (use same value for all bees since centralized)
-        all_obs.append(step_obs)
+        all_obs.append(obs)
         all_actions.append(step_actions)
         all_rewards.append([rewards[f"bee_{i}"] for i in range(num_bees)])
-        all_values.append([step_value] * num_bees)  # Centralized value
-        all_logprobs.append(step_logprobs)
+        all_values.append([step_value] * num_bees)
+        all_logprobs.append(logprobs_t.cpu().numpy().tolist())
         all_dones.append(any(terminated.values()) or any(truncated.values()))
 
         obs = next_obs
@@ -248,6 +286,51 @@ def collect_rollout(
     }
 
 
+def _prebuild_batched_obs(obs_list, num_bees, device):
+    """Pre-convert all timestep observations into stacked numpy arrays for fast indexing.
+    Returns dict of arrays, each shaped (T, num_bees, feat_dim).
+    """
+    T = len(obs_list)
+    keys = ["position", "status", "battery", "flowers", "step_count", "consensus", "retask_board", "action_availability"]
+    defaults = {"battery": np.zeros(2), "retask_board": np.zeros(15), "action_availability": np.ones(3)}
+    
+    # First pass: determine dimensions
+    sample_ob = obs_list[0].get("bee_0", {})
+    dims = {}
+    for key in keys:
+        val = sample_ob.get(key, defaults.get(key, np.zeros(1)))
+        if isinstance(val, (int, float)):
+            dims[key] = 1
+        else:
+            dims[key] = np.asarray(val).ravel().shape[0]
+    
+    # Pre-allocate arrays
+    arrays = {key: np.zeros((T, num_bees, dims[key]), dtype=np.float32) for key in keys}
+    actions_flat = np.zeros((T, num_bees), dtype=np.int64)
+    
+    for t in range(T):
+        for i in range(num_bees):
+            ob = obs_list[t].get(f"bee_{i}", {})
+            for key in keys:
+                val = ob.get(key, defaults.get(key, np.zeros(dims[key])))
+                if isinstance(val, (int, float)):
+                    arrays[key][t, i, 0] = float(val)
+                else:
+                    arr = np.asarray(val, dtype=np.float32).ravel()
+                    arrays[key][t, i, :len(arr)] = arr[:dims[key]]
+    
+    return arrays, dims
+
+
+def _prebuild_global_states(obs_list, num_bees, device):
+    """Pre-build all global states as a single tensor (T, global_dim)."""
+    states = []
+    for t in range(len(obs_list)):
+        gs = obs_to_global_state(obs_list[t], num_bees, device)
+        states.append(gs.squeeze(0))
+    return torch.stack(states)  # (T, global_dim)
+
+
 def ppo_update(
     actor: nn.Module,
     critic: nn.Module,
@@ -261,7 +344,7 @@ def ppo_update(
     num_epochs: int = 4,
     minibatch_size: int = 64,
 ) -> dict:
-    """Perform PPO update on actor and critic."""
+    """Perform PPO update on actor and critic. BATCHED for performance."""
     obs_list = batch["obs"]
     actions_list = batch["actions"]
     old_logprobs = torch.tensor(batch["logprobs"], dtype=torch.float32, device=device)
@@ -272,6 +355,16 @@ def ppo_update(
 
     # Normalize advantages
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # Pre-build obs arrays and global states for fast indexing
+    obs_arrays, dims = _prebuild_batched_obs(obs_list, num_bees, device)
+    global_states = _prebuild_global_states(obs_list, num_bees, device)  # (T, global_dim)
+
+    # Pre-build actions tensor (T, num_bees)
+    actions_tensor = torch.zeros((T, num_bees), dtype=torch.long, device=device)
+    for t in range(T):
+        for i in range(num_bees):
+            actions_tensor[t, i] = actions_list[t].get(f"bee_{i}", 0)
 
     total_policy_loss = 0.0
     total_value_loss = 0.0
@@ -284,70 +377,60 @@ def ppo_update(
         for start in range(0, T, minibatch_size):
             end = min(start + minibatch_size, T)
             mb_indices = indices[start:end]
+            mb_size = len(mb_indices)
 
-            policy_loss_sum = 0.0
-            value_loss_sum = 0.0
-            entropy_sum = 0.0
-            count = 0
+            # Build batched obs for all bees across all timesteps in minibatch
+            # Shape: (mb_size * num_bees, feat_dim) for each key
+            mb_obs = {}
+            for key in obs_arrays:
+                # (mb_size, num_bees, dim) -> (mb_size * num_bees, dim)
+                arr = obs_arrays[key][mb_indices]  # (mb_size, num_bees, dim)
+                mb_obs[key] = torch.tensor(
+                    arr.reshape(mb_size * num_bees, -1), dtype=torch.float32, device=device
+                )
 
-            for t in mb_indices:
-                # Get global state for this timestep (for critic)
-                global_state = obs_to_global_state(obs_list[t], num_bees, device)
-                
-                for i in range(num_bees):
-                    agent = f"bee_{i}"
-                    ob = obs_list[t][agent]
-                    ob_tensor = obs_to_tensor(ob, device)
-                    action = actions_list[t][agent]
+            # Batched actor forward — ONE call for all bees across all timesteps
+            action_logits = actor(mb_obs)  # (mb_size * num_bees, action_dim)
 
-                    # Forward pass
-                    action_logits = actor(ob_tensor)
-                    
-                    # Apply action masking
-                    # NOTE: action_availability = [can_harvest, can_groom, can_do_nothing]
-                    # But action space is: 0=DONOTHING, 1=HARVEST, 2=GROOM
-                    # So we need to reorder the mask to match action indices
-                    if "action_availability" in ob:
-                        avail = ob["action_availability"]
-                        mask = _ensure_tensor([avail[2], avail[0], avail[1]], device)
-                        action_logits = action_logits + (mask - 1.0) * 1e8
+            # Apply action masking (batched)
+            if "action_availability" in mb_obs:
+                avail = mb_obs["action_availability"]  # (mb_size*num_bees, 3)
+                mask = torch.stack([avail[:, 2], avail[:, 0], avail[:, 1]], dim=-1)
+                action_logits = action_logits + (mask - 1.0) * 1e8
 
-                    probs = F.softmax(action_logits, dim=-1)
-                    dist = torch.distributions.Categorical(probs)
-                    
-                    new_logprob = dist.log_prob(torch.tensor([action], device=device))
-                    entropy = dist.entropy()
-                    value = critic(global_state)  # Use global state for centralized critic
+            probs = F.softmax(action_logits, dim=-1)
+            dist = torch.distributions.Categorical(probs)
 
-                    # PPO ratio
-                    old_lp = old_logprobs[t, i]
-                    ratio = torch.exp(new_logprob - old_lp)
-                    
-                    # Clipped surrogate objective
-                    adv = advantages[t, i]
-                    surr1 = ratio * adv
-                    surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
-                    policy_loss = -torch.min(surr1, surr2)
+            # Get actions for this minibatch: (mb_size, num_bees) -> (mb_size * num_bees,)
+            mb_actions = actions_tensor[mb_indices].reshape(-1)
+            new_logprobs = dist.log_prob(mb_actions)
+            entropy = dist.entropy()
 
-                    # Value loss
-                    ret = returns[t, i]
-                    value_loss = F.mse_loss(value.squeeze(-1), ret.view(1))
+            # Critic: one forward pass per timestep in minibatch
+            mb_global = global_states[mb_indices]  # (mb_size, global_dim)
+            values = critic(mb_global).squeeze(-1)  # (mb_size,)
+            # Expand to (mb_size, num_bees) since centralized
+            values_expanded = values.unsqueeze(1).expand(mb_size, num_bees).reshape(-1)
 
-                    policy_loss_sum += policy_loss.mean()
-                    value_loss_sum += value_loss
-                    entropy_sum += entropy.mean()
-                    count += 1
+            # PPO ratio
+            mb_old_lp = old_logprobs[mb_indices].reshape(-1)  # (mb_size*num_bees,)
+            ratio = torch.exp(new_logprobs - mb_old_lp)
 
-            if count == 0:
-                continue
+            # Clipped surrogate
+            mb_adv = advantages[mb_indices].reshape(-1)  # (mb_size*num_bees,)
+            surr1 = ratio * mb_adv
+            surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * mb_adv
+            policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Average losses
-            policy_loss_avg = policy_loss_sum / count
-            value_loss_avg = value_loss_sum / count
-            entropy_avg = entropy_sum / count
+            # Value loss
+            mb_ret = returns[mb_indices].reshape(-1)  # (mb_size*num_bees,)
+            value_loss = F.mse_loss(values_expanded, mb_ret)
+
+            # Entropy
+            entropy_mean = entropy.mean()
 
             # Total loss
-            loss = policy_loss_avg + value_coef * value_loss_avg - entropy_coef * entropy_avg
+            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_mean
 
             # Optimize
             opt_actor.zero_grad()
@@ -358,9 +441,9 @@ def ppo_update(
             opt_actor.step()
             opt_critic.step()
 
-            total_policy_loss += policy_loss_avg.item()
-            total_value_loss += value_loss_avg.item()
-            total_entropy += entropy_avg.item()
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+            total_entropy += entropy_mean.item()
             num_updates += 1
 
     return {
@@ -664,7 +747,7 @@ def train_hrl(args):
     ).to(device)
     
     # Critic for HRL
-    obs_dim_per_bee = 3 + 2 + (env.num_flowers * 12) + 1 + env.num_bees + (5 * env.retask_board_size)
+    obs_dim_per_bee = 3 + 2 + 2 + (env.num_flowers * 12) + 1 + env.num_bees + (5 * env.retask_board_size)
     global_state_size = obs_dim_per_bee * env.num_bees
     
     critic = HRLCritic(
@@ -961,8 +1044,8 @@ def train_orbital_v2(args):
     ).to(device)
 
     # Calculate global state size for critic (position + status per bee + flower features)
-    # position(3) + status(2) + flowers(num_flowers*12) + step(1) + consensus(num_bees) + retask_board(5*size)
-    obs_dim_per_bee = 3 + 2 + (env.num_flowers * 12) + 1 + env.num_bees + (5 * env.retask_board_size)
+    # position(3) + status(2) + battery(2) + flowers(num_flowers*12) + step(1) + consensus(num_bees) + retask_board(5*size)
+    obs_dim_per_bee = 3 + 2 + 2 + (env.num_flowers * 12) + 1 + env.num_bees + (5 * env.retask_board_size)
     global_state_size = obs_dim_per_bee * env.num_bees  # Centralized critic sees all bees
 
     critic = CentralizedCritic(

@@ -30,23 +30,31 @@ ENV/
 env.bak/
 venv.bak/
 
-# PyTorch Models (keeping checkpoints but ignoring temp files)
+# Model checkpoints (too large for GitHub)
+outputs/
+outputs_hrl/
+output/
+*.pt
+*.pth
 *.pth.tar
 
-# Model checkpoints (too large for GitHub)
-best/
-final/
-upd*/
-outputs/*.pt
+# TensorBoard
+events.out.tfevents.*
 
-# Large image files
-bee_orbit_3d.png
-
-# Large telemetry data
-telemetrybridge.json
-
-# Logs
+# Logs & training artifacts
 *.log
+logs/
+training_log*.txt
+training_curves.json
+training_curves.png
+telemetry_evaluation_results.json
+
+# Large data files
+telemetrybridge.json
+*.jsonl
+
+# Generated images
+bee_orbit_3d.png
 
 # IDE
 .vscode/
@@ -59,8 +67,8 @@ telemetrybridge.json
 .DS_Store
 Thumbs.db
 
-# TensorBoard
-events.out.tfevents.*
-
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# Misc
+Music/
