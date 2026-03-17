@@ -1,0 +1,43 @@
+# Quick Training Config — smaller scale to verify targeting works
+env:
+  num_bees: 5
+  num_flowers: 12
+  grid_size: 25
+  max_steps: 600
+  harvest_radius: 20.0
+  reach_margin: 4.0
+  lambda_z: 0.5
+  orbit_scale: 0.8
+  time_window_min: 10
+  time_window_max: 80
+  battery_min_steps: 80
+  battery_max_steps: 160
+  recharge_steps: 20
+  drain_per_step: 1.0
+  low_battery_chance: 0.08
+  retask_board_size: 3
+  retask_timeout_steps: 40
+  shaping_weight: 0.05
+  anti_spam_pen: -0.005
+  verbose: false
+
+train:
+  hidden_dim: 128
+  num_updates: 200
+  rollout_len: 600
+  gamma: 0.99
+  lam: 0.95
+  clip_ratio: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.03
+  lr_actor: 0.0005
+  lr_critic: 0.0005
+  num_epochs: 2
+  minibatch_size: 64
+  early_stopping: true
+  patience: 150
+  min_harvest_rate: 0.90
+  convergence_window: 20
+
+output:
+  path: outputs_hrl_gossip

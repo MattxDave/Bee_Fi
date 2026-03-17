@@ -396,6 +396,16 @@ class Bee:
         return b
 
 
+# Task description vocabulary (cycled by flower index)
+TASK_DESCRIPTIONS = [
+    "Capture imagery",
+    "Relay communication",
+    "Data collection",
+    "Sensor calibration",
+    "Harvest pollen",
+]
+
+
 class Flower:
     def __init__(
         self,
@@ -426,6 +436,15 @@ class Flower:
         self.window_type = window_type  # 'NONE', 'HARD', 'SOFT'
         self.window_period = window_period  # For SOFT: repeat every N steps (e.g., 100 = daily)
         self.window_missed = False  # Track if HARD window permanently missed
+
+        # =====================================================================
+        # Task metadata (satellite_constellation_scheduling-inspired)
+        # =====================================================================
+        self.task_id: str = f"TASK-{flower_id:03d}-{self.x}-{self.y}"
+        self.task_description: str = TASK_DESCRIPTIONS[flower_id % len(TASK_DESCRIPTIONS)]
+        self.status: str = "unassigned"  # unassigned | assigned | in_progress | completed | expired
+        self.deadline_step: int | None = None  # absolute step by which task must be completed
+        self.created_step: int = 0  # step when the task was created
 
     @property
     def center_xy(self):
@@ -513,6 +532,16 @@ class Flower:
             "busy_by": (int(self.busy_by) if getattr(self, "busy_by", None) is not None else None),
             # optional label
             "flower_id": str(getattr(self, "flower_id", f"flower_{getattr(self,'id',0)}")),
+            # task metadata
+            "task_id": str(getattr(self, "task_id", f"TASK-{getattr(self, 'id', 0):03d}")),
+            "task_description": str(getattr(self, "task_description", "Harvest pollen")),
+            "status": str(getattr(self, "status", "unassigned")),
+            "deadline_step": (
+                int(self.deadline_step)
+                if getattr(self, "deadline_step", None) is not None
+                else None
+            ),
+            "created_step": int(getattr(self, "created_step", 0)),
         }
 
     @classmethod
@@ -538,4 +567,11 @@ class Flower:
         f.expired = bool(d.get("expired", False))
         f.busy_by = d.get("busy_by")
         f.flower_id = d.get("flower_id", f"flower_{f.id}")
+        # task metadata
+        f.task_id = d.get("task_id", f"TASK-{f.id:03d}-{f.x}-{f.y}")
+        f.task_description = d.get("task_description", "Harvest pollen")
+        f.status = d.get("status", "unassigned")
+        dl = d.get("deadline_step")
+        f.deadline_step = int(dl) if dl is not None else None
+        f.created_step = int(d.get("created_step", 0))
         return f

@@ -185,6 +185,7 @@ def collect_rollout(
     """
     obs = env.reset()
     num_bees = len(env.bees)
+    has_claim_head = getattr(actor, 'claim_head', None) is not None
 
     # Storage
     all_obs = []
@@ -193,6 +194,10 @@ def collect_rollout(
     all_values = []
     all_logprobs = []
     all_dones = []
+    all_targets = []       # flower target per bee per step
+    all_target_logprobs = []  # log-prob of chosen target
+    all_claims = []        # gossip claim per bee per step
+    all_claim_logprobs = []  # log-prob of chosen claim
 
     for step in range(rollout_len):
         # Batch all bees into single tensors — ONE forward pass for all bees
@@ -204,8 +209,14 @@ def collect_rollout(
         with torch.no_grad():
             step_value = critic(global_state).item()
 
-            # Single batched forward pass for ALL bees
-            action_logits = actor(batched_obs)  # (num_bees, action_dim)
+            # Single batched forward pass for ALL bees (with target + claim logits)
+            if has_claim_head:
+                action_logits, claim_logits, target_logits = actor(
+                    batched_obs, return_claims=True, return_targets=True
+                )
+            else:
+                action_logits, target_logits = actor(batched_obs, return_targets=True)
+                claim_logits = None
 
             # Apply action masking (batched)
             if "action_availability" in batched_obs:
@@ -224,17 +235,68 @@ def collect_rollout(
                 actions_t = torch.argmax(probs, dim=-1)
                 logprobs_t = torch.log(probs.gather(-1, actions_t.unsqueeze(-1)) + 1e-8).squeeze(-1)
 
+            # --- Sample flower targets for bees that chose HARVEST (action=1) ---
+            target_probs = F.softmax(target_logits, dim=-1)  # (num_bees, num_flowers)
+            if stochastic:
+                target_dist = torch.distributions.Categorical(target_probs)
+                targets_t = target_dist.sample()         # (num_bees,)
+                target_lp_t = target_dist.log_prob(targets_t)  # (num_bees,)
+            else:
+                targets_t = torch.argmax(target_probs, dim=-1)
+                target_lp_t = torch.log(target_probs.gather(-1, targets_t.unsqueeze(-1)) + 1e-8).squeeze(-1)
+
+            # --- Sample gossip claims ---
+            if claim_logits is not None:
+                claim_probs = F.softmax(claim_logits, dim=-1)  # (num_bees, board_size+1)
+                if stochastic:
+                    claim_dist = torch.distributions.Categorical(claim_probs)
+                    claims_t = claim_dist.sample()          # (num_bees,)
+                    claim_lp_t = claim_dist.log_prob(claims_t)  # (num_bees,)
+                else:
+                    claims_t = torch.argmax(claim_probs, dim=-1)
+                    claim_lp_t = torch.log(claim_probs.gather(-1, claims_t.unsqueeze(-1)) + 1e-8).squeeze(-1)
+                # Check which bees actually have inbox items (retask_board not all zeros)
+                rtb = batched_obs.get("retask_board", None)
+                has_inbox = (rtb is not None and rtb.abs().sum(dim=-1) > 0).float() if rtb is not None else torch.zeros(num_bees, device=device)
+            else:
+                claims_t = torch.zeros(num_bees, dtype=torch.long, device=device)
+                claim_lp_t = torch.zeros(num_bees, device=device)
+                has_inbox = torch.zeros(num_bees, device=device)
+
+            # Combine log-probs: action + target (HARVEST) + claim (if inbox non-empty)
+            harvest_mask = (actions_t == 1).float()
+            combined_logprobs = logprobs_t + harvest_mask * target_lp_t + has_inbox * claim_lp_t
+
         # Build action dict for env
         step_actions = {f"bee_{i}": int(actions_t[i].item()) for i in range(num_bees)}
 
-        # Step environment (chain relay handles retasking internally)
-        next_obs, rewards, terminated, truncated, infos, _ = env.step(step_actions)
+        # Build targets dict for env (flower index each bee wants to harvest)
+        step_targets = {f"bee_{i}": int(targets_t[i].item()) for i in range(num_bees)}
+
+        # Build gossip claims dict for env
+        board_size = getattr(env, 'retask_board_size', 3)
+        step_gossip_claims = None
+        if has_claim_head:
+            step_gossip_claims = {}
+            for i in range(num_bees):
+                c = int(claims_t[i].item())
+                # Last index (== board_size) means "no claim"
+                step_gossip_claims[f"bee_{i}"] = c if c < board_size else None
+
+        # Step environment (gossiper uses learned claims)
+        next_obs, rewards, terminated, truncated, infos, _ = env.step(
+            step_actions, targets=step_targets, gossip_claims=step_gossip_claims
+        )
 
         all_obs.append(obs)
         all_actions.append(step_actions)
+        all_targets.append(step_targets)
+        all_claims.append([int(claims_t[i].item()) for i in range(num_bees)])
         all_rewards.append([rewards[f"bee_{i}"] for i in range(num_bees)])
         all_values.append([step_value] * num_bees)
-        all_logprobs.append(logprobs_t.cpu().numpy().tolist())
+        all_logprobs.append(combined_logprobs.cpu().numpy().tolist())
+        all_target_logprobs.append(target_lp_t.cpu().numpy().tolist())
+        all_claim_logprobs.append(claim_lp_t.cpu().numpy().tolist())
         all_dones.append(any(terminated.values()) or any(truncated.values()))
 
         obs = next_obs
@@ -275,9 +337,13 @@ def collect_rollout(
     return {
         "obs": all_obs,
         "actions": all_actions,
+        "targets": all_targets,
+        "claims": np.array(all_claims, dtype=np.int64),
         "rewards": np.array(all_rewards, dtype=np.float32),
         "values": np.array(all_values, dtype=np.float32),
         "logprobs": np.array(all_logprobs, dtype=np.float32),
+        "target_logprobs": np.array(all_target_logprobs, dtype=np.float32),
+        "claim_logprobs": np.array(all_claim_logprobs, dtype=np.float32),
         "advantages": advantages,
         "returns": returns,
         "episode_reward": float(np.sum(all_rewards)),
@@ -347,11 +413,14 @@ def ppo_update(
     """Perform PPO update on actor and critic. BATCHED for performance."""
     obs_list = batch["obs"]
     actions_list = batch["actions"]
+    targets_list = batch.get("targets", None)
+    claims_arr = batch.get("claims", None)
     old_logprobs = torch.tensor(batch["logprobs"], dtype=torch.float32, device=device)
     advantages = torch.tensor(batch["advantages"], dtype=torch.float32, device=device)
     returns = torch.tensor(batch["returns"], dtype=torch.float32, device=device)
 
     T, num_bees = advantages.shape
+    has_claim_head = getattr(actor, 'claim_head', None) is not None
 
     # Normalize advantages
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -362,9 +431,15 @@ def ppo_update(
 
     # Pre-build actions tensor (T, num_bees)
     actions_tensor = torch.zeros((T, num_bees), dtype=torch.long, device=device)
+    targets_tensor = torch.zeros((T, num_bees), dtype=torch.long, device=device)
+    claims_tensor = torch.zeros((T, num_bees), dtype=torch.long, device=device)
     for t in range(T):
         for i in range(num_bees):
             actions_tensor[t, i] = actions_list[t].get(f"bee_{i}", 0)
+            if targets_list is not None:
+                targets_tensor[t, i] = targets_list[t].get(f"bee_{i}", 0)
+    if claims_arr is not None:
+        claims_tensor = torch.tensor(claims_arr, dtype=torch.long, device=device)
 
     total_policy_loss = 0.0
     total_value_loss = 0.0
@@ -390,7 +465,15 @@ def ppo_update(
                 )
 
             # Batched actor forward — ONE call for all bees across all timesteps
-            action_logits = actor(mb_obs)  # (mb_size * num_bees, action_dim)
+            if has_claim_head:
+                action_logits, claim_logits, target_logits = actor(
+                    mb_obs, return_claims=True, return_targets=True
+                )
+            else:
+                action_logits, target_logits = actor(mb_obs, return_targets=True)
+                claim_logits = None
+            # action_logits: (mb_size * num_bees, action_dim)
+            # target_logits: (mb_size * num_bees, num_flowers)
 
             # Apply action masking (batched)
             if "action_availability" in mb_obs:
@@ -406,15 +489,40 @@ def ppo_update(
             new_logprobs = dist.log_prob(mb_actions)
             entropy = dist.entropy()
 
+            # --- Flower target log-probs ---
+            target_probs = F.softmax(target_logits, dim=-1)
+            target_dist = torch.distributions.Categorical(target_probs)
+            mb_targets = targets_tensor[mb_indices].reshape(-1)
+            new_target_logprobs = target_dist.log_prob(mb_targets)
+            target_entropy = target_dist.entropy()
+
+            # Combine: action logprob + target logprob (only for HARVEST actions)
+            harvest_mask = (mb_actions == 1).float()
+            combined_new_logprobs = new_logprobs + harvest_mask * new_target_logprobs
+            combined_entropy = entropy + harvest_mask * target_entropy
+
+            # --- Gossip claim log-probs ---
+            if has_claim_head and claim_logits is not None:
+                claim_probs = F.softmax(claim_logits, dim=-1)
+                claim_dist = torch.distributions.Categorical(claim_probs)
+                mb_claims = claims_tensor[mb_indices].reshape(-1)
+                new_claim_logprobs = claim_dist.log_prob(mb_claims)
+                claim_entropy = claim_dist.entropy()
+                # Only include claim logprob when retask_board is non-empty
+                rtb = mb_obs.get("retask_board", None)
+                has_inbox = (rtb is not None and rtb.abs().sum(dim=-1) > 0).float() if rtb is not None else torch.zeros(mb_size * num_bees, device=device)
+                combined_new_logprobs = combined_new_logprobs + has_inbox * new_claim_logprobs
+                combined_entropy = combined_entropy + has_inbox * claim_entropy
+
             # Critic: one forward pass per timestep in minibatch
             mb_global = global_states[mb_indices]  # (mb_size, global_dim)
             values = critic(mb_global).squeeze(-1)  # (mb_size,)
             # Expand to (mb_size, num_bees) since centralized
             values_expanded = values.unsqueeze(1).expand(mb_size, num_bees).reshape(-1)
 
-            # PPO ratio
+            # PPO ratio (uses combined action + target log-probs)
             mb_old_lp = old_logprobs[mb_indices].reshape(-1)  # (mb_size*num_bees,)
-            ratio = torch.exp(new_logprobs - mb_old_lp)
+            ratio = torch.exp(combined_new_logprobs - mb_old_lp)
 
             # Clipped surrogate
             mb_adv = advantages[mb_indices].reshape(-1)  # (mb_size*num_bees,)
@@ -426,8 +534,8 @@ def ppo_update(
             mb_ret = returns[mb_indices].reshape(-1)  # (mb_size*num_bees,)
             value_loss = F.mse_loss(values_expanded, mb_ret)
 
-            # Entropy
-            entropy_mean = entropy.mean()
+            # Entropy (combined action + target)
+            entropy_mean = combined_entropy.mean()
 
             # Total loss
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_mean
@@ -475,6 +583,7 @@ def collect_hrl_rollout(
     """
     obs = env.reset()
     num_bees = len(env.bees)
+    has_claim_head = getattr(worker, 'claim_head', None) is not None
     
     # Storage
     all_obs = []
@@ -485,8 +594,13 @@ def collect_hrl_rollout(
     all_manager_values = []
     all_logprobs = []
     all_goal_logprobs = []
+    all_targets = []
+    all_target_logprobs = []
+    all_claims = []
+    all_claim_logprobs = []
     all_dones = []
     all_is_manager_step = []
+    all_goal_alignment = []  # Track goal-following rate per step (for manager intrinsic reward)
     
     current_goals = torch.zeros(num_bees, dtype=torch.long, device=device)
     total_episode_reward = 0.0
@@ -520,47 +634,112 @@ def collect_hrl_rollout(
         
         step_obs = {}
         step_actions = {}
-        step_logprobs = []
-        step_worker_values = []
         
-        # Per-bee worker values and actions
+        # ── BATCHED worker inference (all bees in one forward pass) ──
+        # 1) Build global state ONCE per step
+        global_state = obs_to_global_state(obs, num_bees, device)
+        
+        with torch.no_grad():
+            # 2) Worker value: per-bee values from centralized critic
+            worker_vals = critic.forward_worker(global_state, current_goals).squeeze(0)  # (num_bees,)
+            
+            # 3) Batch all bee obs into (num_bees, feat_dim) tensors
+            batched_obs = _batch_obs_to_tensor(obs, num_bees, device)
+            
+            # 4) Single batched worker forward pass with flower targets + claims
+            if has_claim_head:
+                action_logits, claim_logits, target_logits = worker(
+                    batched_obs, current_goals, return_claims=True, return_targets=True
+                )
+            else:
+                action_logits, target_logits = worker(batched_obs, current_goals, return_targets=True)
+                claim_logits = None
+            
+            # 5) Apply action masking (batched)
+            if "action_availability" in batched_obs:
+                avail = batched_obs["action_availability"]  # (num_bees, 3)
+                mask = torch.stack([avail[:, 2], avail[:, 0], avail[:, 1]], dim=-1)
+                action_logits = action_logits + (mask - 1.0) * 1e8
+            
+            probs = F.softmax(action_logits, dim=-1)  # (num_bees, 3)
+            
+            if stochastic:
+                dist = torch.distributions.Categorical(probs)
+                actions_t = dist.sample()          # (num_bees,)
+                logprobs_t = dist.log_prob(actions_t)  # (num_bees,)
+            else:
+                actions_t = torch.argmax(probs, dim=-1)
+                logprobs_t = torch.log(probs.gather(-1, actions_t.unsqueeze(-1)) + 1e-8).squeeze(-1)
+            
+            # 6) Sample flower targets
+            target_probs = F.softmax(target_logits, dim=-1)  # (num_bees, num_flowers)
+            if stochastic:
+                target_dist = torch.distributions.Categorical(target_probs)
+                targets_t = target_dist.sample()  # (num_bees,)
+                target_lp_t = target_dist.log_prob(targets_t)  # (num_bees,)
+            else:
+                targets_t = torch.argmax(target_probs, dim=-1)
+                target_lp_t = torch.log(target_probs.gather(-1, targets_t.unsqueeze(-1)) + 1e-8).squeeze(-1)
+            
+            # 7) Sample gossip claims
+            if claim_logits is not None:
+                claim_probs = F.softmax(claim_logits, dim=-1)  # (num_bees, board_size+1)
+                if stochastic:
+                    claim_dist = torch.distributions.Categorical(claim_probs)
+                    claims_t = claim_dist.sample()  # (num_bees,)
+                    claim_lp_t = claim_dist.log_prob(claims_t)  # (num_bees,)
+                else:
+                    claims_t = torch.argmax(claim_probs, dim=-1)
+                    claim_lp_t = torch.log(claim_probs.gather(-1, claims_t.unsqueeze(-1)) + 1e-8).squeeze(-1)
+                rtb = batched_obs.get("retask_board", None)
+                has_inbox = (rtb is not None and rtb.abs().sum(dim=-1) > 0).float() if rtb is not None else torch.zeros(num_bees, device=device)
+            else:
+                claims_t = torch.zeros(num_bees, dtype=torch.long, device=device)
+                claim_lp_t = torch.zeros(num_bees, device=device)
+                has_inbox = torch.zeros(num_bees, device=device)
+            
+            # Combine action + target logprobs for HARVEST actions + claim logprobs
+            harvest_mask = (actions_t == 1).float()  # 1 = HARVEST
+            combined_logprobs = logprobs_t + harvest_mask * target_lp_t + has_inbox * claim_lp_t
+        
+        # Unpack into per-bee dicts
+        step_logprobs = combined_logprobs.cpu().numpy().tolist()
+        step_target_logprobs = target_lp_t.cpu().numpy().tolist()
+        step_claim_logprobs = claim_lp_t.cpu().numpy().tolist()
+        step_targets = {}
+        step_worker_values = worker_vals.cpu().numpy().tolist()  # Per-bee values
         for i in range(num_bees):
             agent = f"bee_{i}"
-            ob = obs[agent]
-            ob_tensor = obs_to_tensor(ob, device)
-            goal_i = current_goals[i:i+1]  # (1,)
-            
-            with torch.no_grad():
-                # Worker value: use global state + goals
-                global_state = obs_to_global_state(obs, num_bees, device)
-                worker_val = critic.forward_worker(global_state, current_goals).item()
-                
-                # Worker action
-                action_logits = worker(ob_tensor, goal_i)
-                
-                probs = F.softmax(action_logits, dim=-1)
-                
-                if stochastic:
-                    dist = torch.distributions.Categorical(probs)
-                    action = dist.sample()
-                    logprob = dist.log_prob(action)
-                else:
-                    action = torch.argmax(probs, dim=-1)
-                    logprob = torch.log(probs.gather(-1, action.unsqueeze(-1)) + 1e-8).squeeze(-1)
-            
-            step_obs[agent] = ob
-            step_actions[agent] = int(action.item())
-            step_logprobs.append(logprob.item())
-            step_worker_values.append(worker_val)
+            step_obs[agent] = obs[agent]
+            step_actions[agent] = int(actions_t[i].item())
+            step_targets[agent] = int(targets_t[i].item())
         
-        # Step environment
-        next_obs, rewards, terminated, truncated, infos, _ = env.step(step_actions)
+        # Build gossip claims dict for env
+        board_size = getattr(env, 'retask_board_size', 3)
+        step_gossip_claims = None
+        if has_claim_head:
+            step_gossip_claims = {}
+            for i in range(num_bees):
+                c = int(claims_t[i].item())
+                step_gossip_claims[f"bee_{i}"] = c if c < board_size else None
+
+        # Step environment with flower targets and gossip claims
+        next_obs, rewards, terminated, truncated, infos, _ = env.step(
+            step_actions, targets=step_targets, gossip_claims=step_gossip_claims
+        )
         
-        # Add goal-based reward shaping
+        # Add goal-based reward shaping + track goal alignment for manager intrinsic reward
+        goal_aligned_count = 0
         for i in range(num_bees):
             agent = f"bee_{i}"
             goal_reward = env.get_goal_reward(i, step_actions[agent])
             rewards[agent] += goal_reward
+            # Track if worker followed the goal (for manager intrinsic reward)
+            g = current_goals[i].item()
+            a = step_actions[agent]
+            if (g == 0 and a == 0) or (g == 1 and a == 1) or (g == 2 and a == 2) or (g == 3 and a == 1):
+                goal_aligned_count += 1
+        all_goal_alignment.append(goal_aligned_count / num_bees)
         
         # Track harvests
         harvest_count = sum(1 for f in env.flowers if f.harvested)
@@ -579,6 +758,10 @@ def collect_hrl_rollout(
         all_manager_values.append(manager_value)
         all_logprobs.append(step_logprobs)
         all_goal_logprobs.append(goal_lp.cpu().numpy().copy())
+        all_targets.append([int(targets_t[i].item()) for i in range(num_bees)])
+        all_target_logprobs.append(step_target_logprobs)
+        all_claims.append([int(claims_t[i].item()) for i in range(num_bees)])
+        all_claim_logprobs.append(step_claim_logprobs)
         all_dones.append(done)
         all_is_manager_step.append(is_manager_step)
         
@@ -603,8 +786,8 @@ def collect_hrl_rollout(
     if not all_dones[-1]:
         global_state = obs_to_global_state(obs, num_bees, device)
         with torch.no_grad():
-            last_val = critic.forward_worker(global_state, current_goals).item()
-        last_worker_values[:] = last_val
+            last_vals = critic.forward_worker(global_state, current_goals).squeeze(0)  # (num_bees,)
+        last_worker_values = last_vals.cpu().numpy()
     
     gae = np.zeros(num_bees, dtype=np.float32)
     for t in reversed(range(T)):
@@ -629,7 +812,7 @@ def collect_hrl_rollout(
     manager_returns = np.zeros(T, dtype=np.float32)
     
     if len(manager_steps) > 0:
-        # Aggregate rewards between manager steps
+        # Aggregate rewards between manager steps + intrinsic goal-following bonus
         manager_rewards = []
         manager_vals = []
         for idx, ms in enumerate(manager_steps):
@@ -638,6 +821,10 @@ def collect_hrl_rollout(
             interval_reward = sum(
                 sum(all_rewards[t]) for t in range(ms, next_ms)
             ) / num_bees  # Average per bee
+            # Intrinsic reward: how well did workers follow the assigned goals?
+            goal_follow_rate = np.mean(all_goal_alignment[ms:next_ms]) if next_ms > ms else 0.0
+            manager_intrinsic = 0.5 * goal_follow_rate  # Bonus proportional to compliance
+            interval_reward += manager_intrinsic
             manager_rewards.append(interval_reward)
             manager_vals.append(all_manager_values[ms])
         
@@ -681,6 +868,10 @@ def collect_hrl_rollout(
         "worker_values": np.array(all_worker_values, dtype=np.float32),
         "logprobs": np.array(all_logprobs, dtype=np.float32),
         "goal_logprobs": np.array(all_goal_logprobs, dtype=np.float32),
+        "targets": np.array(all_targets, dtype=np.int64),
+        "target_logprobs": np.array(all_target_logprobs, dtype=np.float32),
+        "claims": np.array(all_claims, dtype=np.int64),
+        "claim_logprobs": np.array(all_claim_logprobs, dtype=np.float32),
         "worker_advantages": worker_advantages,
         "worker_returns": worker_returns,
         "manager_advantages": manager_advantages,
@@ -701,12 +892,15 @@ def train_hrl(args):
     
     if args.output:
         out_dir = args.output
-    out_dir = out_dir + "_hrl"  # Separate output for HRL
+    else:
+        out_dir = out_dir + "_hrl"  # Separate output for HRL
+    if args.bsk:
+        out_dir = out_dir + "_bsk"
     
     set_seed(args.seed)
     
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-    print(f"[train_hrl] device={device}, output={out_dir}")
+    print(f"[train_hrl] device={device}, output={out_dir}, bsk={args.bsk}")
     os.makedirs(out_dir, exist_ok=True)
     
     # Create environment
@@ -722,6 +916,7 @@ def train_hrl(args):
         battery_max_steps=env_cfg.get("battery_max_steps", 450),
         recharge_steps=env_cfg.get("recharge_steps", 30),
         verbose=env_cfg.get("verbose", False),
+        use_basilisk=args.bsk,
     )
     
     print(f"[env] num_bees={env.num_bees}, num_flowers={env.num_flowers}")
@@ -747,7 +942,7 @@ def train_hrl(args):
     ).to(device)
     
     # Critic for HRL
-    obs_dim_per_bee = 3 + 2 + 2 + (env.num_flowers * 12) + 1 + env.num_bees + (5 * env.retask_board_size)
+    obs_dim_per_bee = 3 + 2 + 2 + (env.num_flowers * 14) + 1 + env.num_bees + (5 * env.retask_board_size)
     global_state_size = obs_dim_per_bee * env.num_bees
     
     critic = HRLCritic(
@@ -758,17 +953,35 @@ def train_hrl(args):
         grid_size=env.grid_size,
     ).to(device)
     
-    # Optimizers
-    opt_manager = optim.Adam(manager.parameters(), lr=train_cfg.get("lr_actor", 3e-4))
+    # Optimizers — separate worker-critic and manager-critic to avoid gradient interference
+    # Manager-critic params = manager_trunk + manager_v_head
+    mgr_critic_params = list(critic.manager_trunk.parameters()) + list(critic.manager_v_head.parameters())
+    # Worker-critic params = worker_trunk + worker_v_head
+    wkr_critic_params = list(critic.worker_trunk.parameters()) + list(critic.worker_v_head.parameters())
+    
+    # Load HRL-specific config
+    import yaml
+    hrl_cfg = {}
+    if os.path.exists(args.config):
+        with open(args.config) as f:
+            _raw = yaml.safe_load(f) or {}
+            hrl_cfg = _raw.get("hrl", {}) or {}
+    
+    lr_manager = hrl_cfg.get("lr_manager", 1e-4)  # Slower LR for manager
+    hrl_rollout_len = hrl_cfg.get("rollout_len", None)  # HRL-specific rollout length
+    hrl_ppo_epochs = hrl_cfg.get("num_ppo_epochs", 2)  # Fewer PPO epochs for HRL
+    
+    opt_manager = optim.Adam(manager.parameters(), lr=lr_manager)
     opt_worker = optim.Adam(worker.parameters(), lr=train_cfg.get("lr_actor", 3e-4))
-    opt_critic = optim.Adam(critic.parameters(), lr=train_cfg.get("lr_critic", 3e-4))
+    opt_worker_critic = optim.Adam(wkr_critic_params, lr=train_cfg.get("lr_critic", 3e-4))
+    opt_manager_critic = optim.Adam(mgr_critic_params, lr=train_cfg.get("lr_critic", 3e-4))
     
     # TensorBoard
     writer = SummaryWriter(out_dir)
     
     # Training params
     num_updates = train_cfg.get("num_updates", 1500)
-    rollout_len = train_cfg.get("rollout_len", 200)
+    rollout_len = hrl_rollout_len if hrl_rollout_len else train_cfg.get("rollout_len", 200)
     gamma = train_cfg.get("gamma", 0.99)
     lam = train_cfg.get("lam", 0.95)
     clip_ratio = train_cfg.get("clip_ratio", 0.2)
@@ -778,8 +991,22 @@ def train_hrl(args):
     reward_tracker = RewardTracker(window_size=100)
     best_mean_reward = -float("inf")
     
+    # Early stopping settings (same as flat actor)
+    early_stopping = train_cfg.get("early_stopping", True)
+    patience = train_cfg.get("patience", 200)
+    min_harvest_rate = train_cfg.get("min_harvest_rate", 0.95)
+    convergence_window = train_cfg.get("convergence_window", 50)
+    
+    # Track harvest rates for early stopping
+    harvest_rates = []
+    best_harvest_rate = 0.0
+    no_improvement_count = 0
+    converged = False
+    
     print(f"\n[train_hrl] Starting HRL training for {num_updates} updates...")
     print(f"  rollout_len={rollout_len}, manager_interval={args.manager_interval}")
+    if early_stopping:
+        print(f"  Early stopping: patience={patience}, target_harvest_rate={min_harvest_rate:.0%}")
     print()
     
     for update in tqdm(range(1, num_updates + 1), desc="HRL Training"):
@@ -794,6 +1021,8 @@ def train_hrl(args):
         goals = torch.tensor(batch["goals"], dtype=torch.long, device=device)
         old_logprobs = torch.tensor(batch["logprobs"], dtype=torch.float32, device=device)
         old_goal_logprobs = torch.tensor(batch["goal_logprobs"], dtype=torch.float32, device=device)
+        targets_arr = torch.tensor(batch["targets"], dtype=torch.long, device=device)
+        claims_arr = torch.tensor(batch["claims"], dtype=torch.long, device=device)
         worker_advantages = torch.tensor(batch["worker_advantages"], dtype=torch.float32, device=device)
         worker_returns = torch.tensor(batch["worker_returns"], dtype=torch.float32, device=device)
         manager_advantages_np = batch["manager_advantages"]
@@ -802,12 +1031,13 @@ def train_hrl(args):
         
         T = len(obs_list)
         num_bees = env.num_bees
+        has_claim_head_w = getattr(worker, 'claim_head', None) is not None
         
         # Normalize worker advantages
         worker_advantages = (worker_advantages - worker_advantages.mean()) / (worker_advantages.std() + 1e-8)
         
         # ===== WORKER PPO UPDATE (with minibatches and multiple epochs) =====
-        num_ppo_epochs = 4
+        num_ppo_epochs = hrl_ppo_epochs
         minibatch_size = max(1, T // 4)
         
         for epoch in range(num_ppo_epochs):
@@ -826,44 +1056,83 @@ def train_hrl(args):
                     global_state = obs_to_global_state(obs_list[t], num_bees, device)
                     goals_t = goals[t]
                     
-                    # Critic value for this timestep
-                    value = critic.forward_worker(global_state, goals_t)
-                    target = worker_returns[t].mean()
-                    value_loss_sum += F.mse_loss(value.squeeze(), target)
+                    # Critic: per-bee values for this timestep
+                    values = critic.forward_worker(global_state, goals_t).squeeze(0)  # (num_bees,)
+                    targets = worker_returns[t]  # (num_bees,)
+                    value_loss_sum += F.mse_loss(values, targets)
                     
-                    for i in range(num_bees):
-                        agent = f"bee_{i}"
-                        ob = obs_list[t][agent]
-                        ob_tensor = obs_to_tensor(ob, device)
-                        action = actions_list[t][agent]
-                        goal_i = goals_t[i:i+1]
-                        
-                        action_logits = worker(ob_tensor, goal_i)
-                        probs = F.softmax(action_logits, dim=-1)
-                        dist = torch.distributions.Categorical(probs)
-                        
-                        new_logprob = dist.log_prob(torch.tensor([action], device=device))
-                        entropy = dist.entropy()
-                        
-                        ratio = torch.exp(new_logprob - old_logprobs[t, i])
-                        adv = worker_advantages[t, i]
-                        surr1 = ratio * adv
-                        surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
-                        
-                        worker_loss_sum += -torch.min(surr1, surr2).mean()
-                        entropy_sum += entropy.mean()
-                        count += 1
+                    # ── BATCHED worker forward for all bees at timestep t ──
+                    batched_obs_t = _batch_obs_to_tensor(obs_list[t], num_bees, device)
+                    if has_claim_head_w:
+                        action_logits, claim_logits, target_logits = worker(
+                            batched_obs_t, goals_t, return_claims=True, return_targets=True
+                        )
+                    else:
+                        action_logits, target_logits = worker(batched_obs_t, goals_t, return_targets=True)
+                        claim_logits = None
+                    
+                    # Apply action masking (batched)
+                    if "action_availability" in batched_obs_t:
+                        avail = batched_obs_t["action_availability"]  # (num_bees, 3)
+                        mask_reorder = torch.stack([avail[:, 2], avail[:, 0], avail[:, 1]], dim=-1)
+                        action_logits = action_logits + (mask_reorder - 1.0) * 1e8
+                    
+                    probs = F.softmax(action_logits, dim=-1)
+                    dist = torch.distributions.Categorical(probs)
+                    
+                    # Target distribution
+                    target_probs = F.softmax(target_logits, dim=-1)
+                    target_dist = torch.distributions.Categorical(target_probs)
+                    
+                    # Actions for all bees at timestep t
+                    actions_t_tensor = torch.tensor(
+                        [actions_list[t][f"bee_{i}"] for i in range(num_bees)],
+                        device=device, dtype=torch.long,
+                    )
+                    targets_t_tensor = targets_arr[t]  # (num_bees,)
+                    
+                    new_logprobs = dist.log_prob(actions_t_tensor)   # (num_bees,)
+                    new_target_lp = target_dist.log_prob(targets_t_tensor)  # (num_bees,)
+                    entropies = dist.entropy()                        # (num_bees,)
+                    target_entropy = target_dist.entropy()            # (num_bees,)
+                    
+                    # Combined logprobs: action + target (only for HARVEST) + claim (if inbox)
+                    harvest_mask = (actions_t_tensor == 1).float()
+                    combined_new_lp = new_logprobs + harvest_mask * new_target_lp
+                    combined_ent = entropies + 0.5 * harvest_mask * target_entropy
+                    
+                    # Gossip claim logprobs
+                    if has_claim_head_w and claim_logits is not None:
+                        claim_probs = F.softmax(claim_logits, dim=-1)
+                        claim_dist_t = torch.distributions.Categorical(claim_probs)
+                        claims_t_tensor = claims_arr[t]  # (num_bees,)
+                        new_claim_lp = claim_dist_t.log_prob(claims_t_tensor)
+                        claim_ent = claim_dist_t.entropy()
+                        rtb = batched_obs_t.get("retask_board", None)
+                        has_inbox = (rtb is not None and rtb.abs().sum(dim=-1) > 0).float() if rtb is not None else torch.zeros(num_bees, device=device)
+                        combined_new_lp = combined_new_lp + has_inbox * new_claim_lp
+                        combined_ent = combined_ent + 0.3 * has_inbox * claim_ent
+                    
+                    ratios = torch.exp(combined_new_lp - old_logprobs[t])  # (num_bees,)
+                    advs_t = worker_advantages[t]                          # (num_bees,) tensor
+                    
+                    surr1 = ratios * advs_t
+                    surr2 = torch.clamp(ratios, 1.0 - clip_ratio, 1.0 + clip_ratio) * advs_t
+                    
+                    worker_loss_sum += -torch.min(surr1, surr2).mean()
+                    entropy_sum += combined_ent.mean()
+                    count += 1
                 
                 if count > 0:
                     total_loss = (worker_loss_sum / count) + value_coef * (value_loss_sum / len(mb_idx)) - entropy_coef * (entropy_sum / count)
                     
                     opt_worker.zero_grad()
-                    opt_critic.zero_grad()
+                    opt_worker_critic.zero_grad()
                     total_loss.backward()
                     torch.nn.utils.clip_grad_norm_(worker.parameters(), 0.5)
-                    torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(wkr_critic_params, 0.5)
                     opt_worker.step()
-                    opt_critic.step()
+                    opt_worker_critic.step()
         
         # ===== MANAGER PPO UPDATE =====
         manager_steps = [t for t in range(T) if is_manager_step[t]]
@@ -915,7 +1184,7 @@ def train_hrl(args):
                     
                     # Flower features from first bee's obs (same for all)
                     fl = obs_list[t]["bee_0"]["flowers"]
-                    fl_reshaped = np.array(fl).reshape(env.num_flowers, 12)
+                    fl_reshaped = np.array(fl).reshape(env.num_flowers, 14)
                     
                     step_norm = obs_list[t]["bee_0"]["step_count"][0] if hasattr(obs_list[t]["bee_0"]["step_count"], '__len__') else float(obs_list[t]["bee_0"]["step_count"])
                     harvest_ratio = sum(1 for f in fl_reshaped if f[3] > 0.5) / max(1, env.num_flowers)
@@ -946,39 +1215,51 @@ def train_hrl(args):
                     mgr_total = (manager_loss_sum / mgr_count) + value_coef * (mgr_value_loss_sum / mgr_count) - entropy_coef * (mgr_entropy_sum / mgr_count)
                     
                     opt_manager.zero_grad()
-                    opt_critic.zero_grad()
+                    opt_manager_critic.zero_grad()
                     mgr_total.backward()
                     torch.nn.utils.clip_grad_norm_(manager.parameters(), 0.5)
-                    torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(mgr_critic_params, 0.5)
                     opt_manager.step()
-                    opt_critic.step()
+                    opt_manager_critic.step()
         
         # Track reward
         reward_tracker.add_episode(batch["episode_reward"])
         mean_reward = reward_tracker.mean_reward()
         harvest_rate = batch.get("harvest_rate", 0.0)
         
+        # Track harvest rate for early stopping
+        harvest_rates.append(harvest_rate)
+        if len(harvest_rates) > convergence_window:
+            harvest_rates.pop(0)
+        mean_harvest_rate = np.mean(harvest_rates) if harvest_rates else 0.0
+        
         # Log
         writer.add_scalar("reward/episode", batch["episode_reward"], update)
         writer.add_scalar("reward/mean_100", mean_reward, update)
         writer.add_scalar("episode/length", batch["episode_len"], update)
         writer.add_scalar("harvest/rate", harvest_rate, update)
+        writer.add_scalar("performance/mean_harvest_rate", mean_harvest_rate, update)
         
-        if update % 50 == 0:
+        if update % 10 == 0:
             n_eps = batch.get("num_episodes", "?")
             print(
                 f"[upd {update:4d}] reward={batch['episode_reward']:.1f}, "
                 f"mean100={mean_reward:.1f}, harvest={harvest_rate:.0%}, "
+                f"mean_harvest={mean_harvest_rate:.0%}, "
                 f"eps={n_eps}, len={batch['episode_len']}"
             )
         
-        # Save best
-        if mean_reward > best_mean_reward:
+        # Save best (based on harvest rate, not just reward)
+        if mean_harvest_rate > best_harvest_rate and len(harvest_rates) >= convergence_window // 2:
+            best_harvest_rate = mean_harvest_rate
             best_mean_reward = mean_reward
             torch.save(manager.state_dict(), os.path.join(out_dir, "best_manager.pt"))
             torch.save(worker.state_dict(), os.path.join(out_dir, "best_worker.pt"))
             torch.save(critic.state_dict(), os.path.join(out_dir, "best_critic.pt"))
-            print(f"  [BEST] New best mean reward: {best_mean_reward:.2f}")
+            print(f"  [BEST] harvest_rate={best_harvest_rate:.1%}, reward={best_mean_reward:.2f}")
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
         
         # Periodic save
         if update % 100 == 0:
@@ -987,6 +1268,19 @@ def train_hrl(args):
             torch.save(manager.state_dict(), os.path.join(ckpt_dir, "manager.pt"))
             torch.save(worker.state_dict(), os.path.join(ckpt_dir, "worker.pt"))
             torch.save(critic.state_dict(), os.path.join(ckpt_dir, "critic.pt"))
+        
+        # Early stopping check
+        if early_stopping and len(harvest_rates) >= convergence_window:
+            if mean_harvest_rate >= min_harvest_rate:
+                print(f"\n  [CONVERGED] Target harvest rate {min_harvest_rate:.0%} achieved!")
+                print(f"  Mean harvest rate: {mean_harvest_rate:.1%} over {convergence_window} episodes")
+                converged = True
+                break
+            
+            if no_improvement_count >= patience:
+                print(f"\n  [EARLY STOP] No improvement for {patience} updates")
+                print(f"  Best harvest rate: {best_harvest_rate:.1%}")
+                break
     
     # Final save
     torch.save(manager.state_dict(), os.path.join(out_dir, "final_manager.pt"))
@@ -995,6 +1289,8 @@ def train_hrl(args):
     writer.close()
     
     print(f"\n[train_hrl] Training complete!")
+    print(f"  Status: {'CONVERGED' if converged else 'STOPPED'}")
+    print(f"  Best harvest rate: {best_harvest_rate:.1%}")
     print(f"  Best mean reward: {best_mean_reward:.2f}")
     print(f"  Models saved to: {out_dir}")
 
@@ -1008,11 +1304,13 @@ def train_orbital_v2(args):
     # Override with command line args
     if args.output:
         out_dir = args.output
+    if args.bsk:
+        out_dir = out_dir + "_bsk"
     
     set_seed(args.seed)
     
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-    print(f"[train_orbital_v2] device={device}, output={out_dir}")
+    print(f"[train_orbital_v2] device={device}, output={out_dir}, bsk={args.bsk}")
     os.makedirs(out_dir, exist_ok=True)
 
     # Create environment
@@ -1028,6 +1326,7 @@ def train_orbital_v2(args):
         battery_max_steps=env_cfg.get("battery_max_steps", 450),
         recharge_steps=env_cfg.get("recharge_steps", 30),
         verbose=env_cfg.get("verbose", False),  # Quiet by default during training
+        use_basilisk=args.bsk,
     )
 
     print(f"[env] num_bees={env.num_bees}, num_flowers={env.num_flowers}, "
@@ -1044,8 +1343,8 @@ def train_orbital_v2(args):
     ).to(device)
 
     # Calculate global state size for critic (position + status per bee + flower features)
-    # position(3) + status(2) + battery(2) + flowers(num_flowers*12) + step(1) + consensus(num_bees) + retask_board(5*size)
-    obs_dim_per_bee = 3 + 2 + 2 + (env.num_flowers * 12) + 1 + env.num_bees + (5 * env.retask_board_size)
+    # position(3) + status(2) + battery(2) + flowers(num_flowers*14) + step(1) + consensus(num_bees) + retask_board(5*size)
+    obs_dim_per_bee = 3 + 2 + 2 + (env.num_flowers * 14) + 1 + env.num_bees + (5 * env.retask_board_size)
     global_state_size = obs_dim_per_bee * env.num_bees  # Centralized critic sees all bees
 
     critic = CentralizedCritic(
@@ -1237,6 +1536,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--manager-interval", type=int, default=10,
         help="Steps between manager decisions (HRL only)"
+    )
+    parser.add_argument(
+        "--bsk", action="store_true",
+        help="Train with Basilisk orbital dynamics (requires PYTHONPATH to include basilisk/dist3)"
     )
     
     args = parser.parse_args()

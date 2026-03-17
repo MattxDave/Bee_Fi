@@ -19,6 +19,13 @@ from collections import deque
 from datetime import timedelta
 from typing import List, Tuple
 
+import matplotlib
+if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    try:
+        matplotlib.use("TkAgg")
+    except ImportError:
+        pass  # fall back to default
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -217,6 +224,49 @@ def adapt_flowers_vec(
 AC_MAP = {0: "DONOTHING", 1: "HARVEST", 2: "GROOM"}
 
 
+def choose_actions_hrl(manager, worker, env, obs_dicts, current_goals, step, manager_interval,
+                      stochastic: bool, num_bees: int = 25, device: str = "cpu"):
+    """HRL action selection: manager sets goals, worker executes."""
+    import torch.nn.functional as F
+    from train_orbital_v2 import _batch_obs_to_tensor
+    from hrl_policy import build_manager_obs
+
+    is_manager_step = (step % manager_interval == 0)
+
+    if is_manager_step:
+        manager_obs = build_manager_obs(env, device)
+        with torch.no_grad():
+            new_goals, _ = manager.get_goals(manager_obs, stochastic=stochastic)
+            current_goals[:] = new_goals.squeeze(0)
+        env.set_goals(current_goals.cpu().numpy())
+
+    actions = {}
+    claims = {agent: None for agent in obs_dicts}
+
+    with torch.no_grad():
+        batched = _batch_obs_to_tensor(obs_dicts, num_bees, device)
+        logits = worker(batched, current_goals)  # (num_bees, action_dim)
+
+        if "action_availability" in batched:
+            avail = batched["action_availability"]
+            mask = torch.stack([avail[:, 2], avail[:, 0], avail[:, 1]], dim=-1)
+            logits = logits + (mask - 1.0) * 1e8
+
+        probs = F.softmax(logits, dim=-1)
+
+        if stochastic:
+            dist = torch.distributions.Categorical(probs)
+            actions_t = dist.sample()
+        else:
+            actions_t = torch.argmax(probs, dim=-1)
+
+        for agent in obs_dicts:
+            idx = int(agent.split("_")[1])
+            actions[agent] = int(actions_t[idx].item())
+
+    return actions, claims, current_goals
+
+
 def choose_actions(actor, obs_dicts, stochastic: bool, trained_nflowers: int, num_bees: int = 25, device: str = "cpu"):
     """Batched action selection matching training pipeline exactly."""
     import torch.nn.functional as F
@@ -299,6 +349,7 @@ def main():
     p.add_argument("--save", type=str, default="")
     # policy controls
     p.add_argument("--policy", action="store_true")
+    p.add_argument("--hrl", action="store_true", help="Use HRL (Manager+Worker) instead of flat Actor")
     p.add_argument("--model_tag", type=str, default="best")
     p.add_argument("--model_dir", type=str, default="", help="Override model directory (default: from config.yaml)")
     p.add_argument("--episodes", type=int, default=1)
@@ -443,34 +494,95 @@ def main():
     num_bees = len(env.bees)
     ACTION_DIM = 3
 
-    # build models with correct hidden width AND trained num_flowers
-    a_path = os.path.join(out_dir, f"{args.model_tag}_actor.pt")
-    c_path = os.path.join(out_dir, f"{args.model_tag}_critic.pt")
-    hid = infer_hidden_from_checkpoint(a_path, 128)
-    # Infer global_state_size from critic checkpoint (training used obs_to_global_state)
-    gsize = infer_global_state_size_from_checkpoint(c_path, env._get_global_state().shape[0])
-    # Use num_flowers from environment directly (attention model doesn't allow inference from checkpoint)
+    # ── HRL or flat model loading ──
+    use_hrl = getattr(args, 'hrl', False)
     trained_nflowers = getattr(env, "num_flowers", 12)
-    print(f"[policy] inferred hidden: {hid}, gsize={gsize}, trained_nflowers={trained_nflowers}")
-
-    # Include retask_board_size so model shape matches checkpoint (important for trunk input 608 when size>0)
     rtb_size = getattr(env, "retask_board_size", 0)
-    actor, critic = make_model_with_hidden(
-        Actor,
-        CentralizedCritic,
-        num_bees=num_bees,
-        action_dim=ACTION_DIM,
-        gsize=gsize,
-        hidden_dim=hid,
-        num_flowers=trained_nflowers,
-        retask_board_size=rtb_size,
-        grid_size=env.grid_size,
-    )
-    try:
-        _ = load_models(actor, critic, args.model_tag, out_dir)
-    except Exception as e:
-        print(f"[load_models] warning: failed to load checkpoint {args.model_tag}: {e}")
-        print("[load_models] continuing with random-initialized models for visualization")
+
+    if use_hrl:
+        from hrl_policy import ManagerPolicy, GoalConditionedWorker, HRLCritic, build_manager_obs
+        NUM_GOALS = 4
+        MANAGER_INTERVAL = 10
+
+        # Checkpoint paths
+        m_path = os.path.join(out_dir, f"{args.model_tag}_manager.pt")
+        w_path = os.path.join(out_dir, f"{args.model_tag}_worker.pt")
+        c_path = os.path.join(out_dir, f"{args.model_tag}_critic.pt")
+
+        # Infer hidden_dim and global_state_size from critic checkpoint
+        hrl_hidden = 256
+        hrl_gsize = env._get_global_state().shape[0]
+        try:
+            _sd = torch.load(c_path, map_location="cpu", weights_only=True)
+            hrl_hidden = _sd["manager_trunk.0.weight"].shape[0]
+            hrl_gsize  = _sd["manager_trunk.0.weight"].shape[1]
+            del _sd
+            print(f"[HRL] inferred from critic ckpt: hidden={hrl_hidden}, gsize={hrl_gsize}")
+        except Exception as e:
+            print(f"[HRL] could not infer critic dims, using defaults: {e}")
+
+        manager = ManagerPolicy(
+            num_bees=num_bees, num_flowers=trained_nflowers, hidden_dim=hrl_hidden,
+        )
+        worker = GoalConditionedWorker(
+            num_bees=num_bees, action_dim=ACTION_DIM, num_goals=NUM_GOALS,
+            num_flowers=trained_nflowers, retask_board_size=rtb_size,
+            grid_size=env.grid_size, hidden_dim=hrl_hidden,
+        )
+        hrl_critic = HRLCritic(
+            global_state_size=hrl_gsize, num_bees=num_bees,
+            num_goals=NUM_GOALS, hidden_dim=hrl_hidden,
+        )
+
+        # Load HRL checkpoints
+        try:
+            manager.load_state_dict(torch.load(m_path, map_location="cpu", weights_only=True))
+            print(f"[HRL] loaded {m_path}")
+        except Exception as e:
+            print(f"[HRL] warning: could not load manager: {e}")
+        try:
+            worker.load_state_dict(torch.load(w_path, map_location="cpu", weights_only=True))
+            print(f"[HRL] loaded {w_path}")
+        except Exception as e:
+            print(f"[HRL] warning: could not load worker: {e}")
+        try:
+            hrl_critic.load_state_dict(torch.load(c_path, map_location="cpu", weights_only=True))
+            print(f"[HRL] loaded {c_path}")
+        except Exception as e:
+            print(f"[HRL] warning: could not load critic: {e}")
+
+        manager.eval(); worker.eval(); hrl_critic.eval()
+        current_goals = torch.zeros(num_bees, dtype=torch.long)
+        hrl_step_counter = [0]  # mutable counter for closure
+        actor = None  # not used in HRL mode
+        critic = None
+        print(f"[HRL] Manager+Worker loaded. Goals every {MANAGER_INTERVAL} steps.")
+    else:
+        # ── Flat Actor-Critic loading ──
+        a_path = os.path.join(out_dir, f"{args.model_tag}_actor.pt")
+        c_path = os.path.join(out_dir, f"{args.model_tag}_critic.pt")
+        hid = infer_hidden_from_checkpoint(a_path, 128)
+        gsize = infer_global_state_size_from_checkpoint(c_path, env._get_global_state().shape[0])
+        print(f"[policy] inferred hidden: {hid}, gsize={gsize}, trained_nflowers={trained_nflowers}")
+
+        actor, critic = make_model_with_hidden(
+            Actor,
+            CentralizedCritic,
+            num_bees=num_bees,
+            action_dim=ACTION_DIM,
+            gsize=gsize,
+            hidden_dim=hid,
+            num_flowers=trained_nflowers,
+            retask_board_size=rtb_size,
+            grid_size=env.grid_size,
+        )
+        try:
+            _ = load_models(actor, critic, args.model_tag, out_dir)
+        except Exception as e:
+            print(f"[load_models] warning: failed to load checkpoint {args.model_tag}: {e}")
+            print("[load_models] continuing with random-initialized models for visualization")
+        manager = None
+        worker = None
 
     # Map telemetry IDs -> bees (first N)
     if telemetry_enabled:
@@ -484,6 +596,9 @@ def main():
 
     for ep in range(1, args.episodes + 1):
         obs = env.reset()
+        if use_hrl:
+            hrl_step_counter[0] = 0
+            current_goals.zero_()
         if telemetry_enabled and telemetry is not None:
             telemetry.reset()
 
@@ -921,10 +1036,18 @@ def main():
 
         def update(_frame_idx):
             nonlocal obs
-            actions, claims = choose_actions(
-                actor, obs, stochastic=args.stochastic, trained_nflowers=trained_nflowers,
-                num_bees=num_bees, device="cpu"
-            )
+            if use_hrl:
+                actions, claims, _ = choose_actions_hrl(
+                    manager, worker, env, obs, current_goals,
+                    hrl_step_counter[0], MANAGER_INTERVAL,
+                    stochastic=args.stochastic, num_bees=num_bees, device="cpu"
+                )
+                hrl_step_counter[0] += 1
+            else:
+                actions, claims = choose_actions(
+                    actor, obs, stochastic=args.stochastic, trained_nflowers=trained_nflowers,
+                    num_bees=num_bees, device="cpu"
+                )
             # draw provisional claim arrows (before env resolves)
             for pl in provisional_claim_lines:
                 try:

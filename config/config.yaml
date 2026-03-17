@@ -14,6 +14,7 @@ env:
   
   # Episode Settings
   max_steps: 1200          # Maximum steps per episode (enough for full battery cycling)
+  # Note: deadline formula is 70-95% of max_steps based on priority
   
   # Harvesting
   harvest_radius: 27.0      # Euclidean distance from current bee position to flower (scaled with grid)
@@ -81,6 +82,9 @@ train:
 hrl:
   manager_interval: 10     # Steps between manager decisions
   num_goals: 4             # Number of goal types (IDLE, HARVEST, GROOM, ASSIST)
+  rollout_len: 1200        # HRL needs full-episode rollouts (>= max_steps)
+  lr_manager: 0.0001       # Slower LR for manager (fewer data points)
+  num_ppo_epochs: 2        # Fewer PPO epochs for HRL (manager has small batch)
 
 # --------------------------
 # OUTPUT SETTINGS

@@ -1,0 +1,47 @@
+{
+  "beefi_hrl": [
+    {
+      "episode": 0,
+      "harvest_rate": 0.78,
+      "harvested": 39,
+      "expired": 11,
+      "total_flowers": 50,
+      "alive_sats": 25,
+      "dead_sats": 0,
+      "total_reward": 586.2000000000222,
+      "steps": 1053
+    }
+  ],
+  "gradient_policy": [
+    {
+      "episode": 0,
+      "harvest_rate": 0.76,
+      "harvested": 38,
+      "total_flowers": 50,
+      "dead_sats": 0,
+      "alive_sats": 25,
+      "total_reward": -3717.259999999995,
+      "steps": 1043
+    }
+  ],
+  "config": {
+    "episodes": 1,
+    "hrl": {
+      "model_dir": "outputs_hrl_bsk",
+      "num_sats": 25,
+      "num_tasks": 50,
+      "grid": 75,
+      "steps": 1200,
+      "manager_interval": 10
+    },
+    "gradient": {
+      "num_sats": 25,
+      "num_tasks": 50,
+      "grid": 75,
+      "steps": 1200,
+      "mapper": "flatten_norm",
+      "env": "BSK"
+    },
+    "seed": 42
+  }
+}

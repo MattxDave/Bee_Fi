@@ -33,10 +33,17 @@ venv.bak/
 # Model checkpoints (too large for GitHub)
 outputs/
 outputs_hrl/
+outputs_bsk_bsk/
+outputs_hrl_bsk/
+outputs_hrl_gossip*/
+outputs_target_test/
 output/
 *.pt
 *.pth
 *.pth.tar
+
+# Basilisk (large external dependency)
+basilisk/
 
 # TensorBoard
 events.out.tfevents.*
@@ -72,3 +79,6 @@ Thumbs.db
 
 # Misc
 Music/
+
+# External repos (has its own git)
+satellite_constellation_scheduling/

@@ -32,12 +32,12 @@ class Actor(nn.Module):
         self.action_availability_fc = nn.Sequential(nn.Linear(3, 32), nn.LayerNorm(32), nn.ReLU())
 
         # --- NEW: Attention-Based Flower Encoder ---
-        # We will embed each flower's 12 features (with time window info) into a 128-dim vector
+        # We will embed each flower's 14 features (with time window + priority/deadline) into a 128-dim vector
         self.flower_embed_dim = 128
         self.flowers_fc = nn.Sequential(
             nn.Linear(
-                12, self.flower_embed_dim
-            ),  # 12 features: 9 original + 3 time window features
+                14, self.flower_embed_dim
+            ),  # 14 features: 9 original + 3 time window + priority + deadline_urgency
             nn.LayerNorm(self.flower_embed_dim),
             nn.ReLU(),
         )
@@ -85,6 +85,27 @@ class Actor(nn.Module):
         if retask_board_size > 0:
             self.claim_head = nn.Linear(hidden_dim, retask_board_size + 1)  # +1 for no-claim
 
+        # --- Flower Target Head (Multi-Criteria Scorer) ---
+        # When the bee chooses HARVEST, this head selects WHICH flower to target.
+        # Uses explicit domain criteria: distance, pollen, priority, deadline urgency,
+        # window type, and time-to-window, combined with learned attention to make
+        # an informed flower selection.
+        #
+        # Architecture:
+        #   1. Extract 6 explicit scoring features per flower from the raw obs
+        #   2. Combine with bee trunk state + flower attention embedding
+        #   3. Score each flower through a small MLP
+        target_input_dim = self.flower_embed_dim + hidden_dim + 6  # attended_flower + trunk + 6 criteria
+        self.target_scorer = nn.Sequential(
+            nn.Linear(target_input_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 1),  # scalar score per flower
+        )
+
         # Better initialization
         self.apply(self._init_weights)
 
@@ -95,7 +116,7 @@ class Actor(nn.Module):
             if module.bias is not None:
                 torch.nn.init.constant_(module.bias, 0.0)
 
-    def forward(self, obs_dict, return_claims: bool = False):
+    def forward(self, obs_dict, return_claims: bool = False, return_targets: bool = False):
         def ensure2d(x: torch.Tensor) -> torch.Tensor:
             x = x if x.dim() == 2 else x.view(1, -1)
             return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -109,12 +130,12 @@ class Actor(nn.Module):
         flowers = ensure2d(obs_dict["flowers"])
         B = flowers.shape[0]
 
-        # 1. Reshape to (Batch, NumFlowers, 12 Features)
+        # 1. Reshape to (Batch, NumFlowers, 14 Features)
         try:
-            flowers_reshaped = flowers.view(B, self.num_flowers, 12)
+            flowers_reshaped = flowers.view(B, self.num_flowers, 14)
         except RuntimeError as e:
             print(
-                f"Policy ERROR: Flower input shape mismatch. Expected {self.num_flowers * 12} features, got {flowers.shape[1]}"
+                f"Policy ERROR: Flower input shape mismatch. Expected {self.num_flowers * 14} features, got {flowers.shape[1]}"
             )
             raise e
 
@@ -127,6 +148,8 @@ class Actor(nn.Module):
         # feature 9: is_harvestable_now - 0/1 flag (time window check)
         # feature 10: is_hard_window - 0/1 flag
         # feature 11: time_to_window - already normalized by max_steps in env
+        # feature 12: priority - already 0-1 range
+        # feature 13: deadline_urgency - already 0-1 range
 
         # 3. Embed each flower independently
         # Input: (B, N, 12) -> Output: (B, N, 128)
@@ -194,6 +217,57 @@ class Actor(nn.Module):
         h = self.trunk(h)
 
         action_logits = self.policy_head(h)
+
+        # --- Flower Target Logits (Multi-Criteria Scorer) ---
+        # Score each flower using explicit domain criteria + learned attention.
+        # attended_flowers: (B, N_flowers, 128) — saved from transformer above
+        target_logits = None
+        if return_targets:
+            # Extract 6 explicit scoring criteria from raw flower features:
+            #   distance (inverted: closer = higher), pollen, priority,
+            #   deadline_urgency, is_hard_window, time_to_window
+            dist_score = 1.0 - flowers_reshaped[:, :, 8].clamp(0, 2)    # closer → higher (0=right on top, 1=at radius)
+            pollen_score = flowers_reshaped[:, :, 2]                     # higher pollen → more valuable
+            priority_score = flowers_reshaped[:, :, 12]                  # higher priority → more important
+            deadline_score = flowers_reshaped[:, :, 13]                  # higher urgency → must harvest soon
+            hard_window = flowers_reshaped[:, :, 10]                     # HARD windows need attention
+            time_to_win = flowers_reshaped[:, :, 11]                     # smaller → window closing soon
+
+            # Stack into (B, N_flowers, 6) criteria tensor
+            criteria = torch.stack([
+                dist_score, pollen_score, priority_score,
+                deadline_score, hard_window, time_to_win
+            ], dim=-1)  # (B, N, 6)
+
+            # Expand trunk state to match flower dimension: (B, hidden) → (B, N, hidden)
+            trunk_expanded = h.unsqueeze(1).expand(B, self.num_flowers, -1)  # (B, N, hidden)
+
+            # Concatenate: [attended_flower_embed, trunk_state, criteria] per flower
+            target_input = torch.cat([attended_flowers, trunk_expanded, criteria], dim=-1)  # (B, N, 128+hidden+6)
+
+            # Score each flower
+            target_logits = self.target_scorer(target_input).squeeze(-1)  # (B, N)
+
+            # Mask out flowers that are not valid targets
+            # flowers_reshaped[:, :, 3] = harvested flag
+            # flowers_reshaped[:, :, 6] = reachable flag
+            # flowers_reshaped[:, :, 7] = fits flag
+            # flowers_reshaped[:, :, 9] = is_harvestable_now flag
+            harvestable_mask = (
+                (flowers_reshaped[:, :, 3] < 0.5)   # not harvested
+                & (flowers_reshaped[:, :, 6] > 0.5)  # reachable
+                & (flowers_reshaped[:, :, 7] > 0.5)  # fits in capacity
+                & (flowers_reshaped[:, :, 9] > 0.5)  # in time window
+            ).float()
+
+            # Apply mask: set invalid flower logits to large negative
+            target_logits = target_logits + (harvestable_mask - 1.0) * 1e8
+
+        if return_targets:
+            if return_claims and self.claim_head is not None:
+                claim_logits = self.claim_head(h)
+                return action_logits, claim_logits, target_logits
+            return action_logits, target_logits
 
         if return_claims and self.claim_head is not None:
             claim_logits = self.claim_head(h)

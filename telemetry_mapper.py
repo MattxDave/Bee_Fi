@@ -237,9 +237,52 @@ class TelemetryMapper:
     # Time Conversion
     # ─────────────────────────────────────────────────────────────────────────
 
-    def set_episode_start(self, unix_timestamp: float):
+    def _parse_deadline_str(self, deadline_str: str) -> float:
+        """Parse deadline string to unix timestamp.
+        
+        Handles formats:
+          - '02/26/2026 19:17:18:753'  (MM/DD/YYYY HH:MM:SS:mmm)
+          - '2026-02-26T19:17:18Z'     (ISO 8601)
+          - '2026-02-11T16:50:24.893806Z'
+        """
+        if not deadline_str or not isinstance(deadline_str, str):
+            return 0.0
+        
+        # Try MM/DD/YYYY HH:MM:SS:mmm  (custom RITA format)
+        try:
+            parts = deadline_str.split(' ')
+            date_part = parts[0]
+            time_part = parts[1] if len(parts) > 1 else '00:00:00:000'
+            # Replace last colon with dot for milliseconds
+            time_parts = time_part.split(':')
+            if len(time_parts) == 4:
+                time_clean = ':'.join(time_parts[:3]) + '.' + time_parts[3]
+            else:
+                time_clean = time_part
+            dt = datetime.strptime(f'{date_part} {time_clean}', '%m/%d/%Y %H:%M:%S.%f')
+            return dt.timestamp()
+        except (ValueError, IndexError):
+            pass
+        
+        # Try ISO 8601
+        try:
+            ts_clean = deadline_str.replace('Z', '+00:00')
+            dt = datetime.fromisoformat(ts_clean)
+            return dt.timestamp()
+        except ValueError:
+            pass
+        
+        # Try as raw float
+        try:
+            return float(deadline_str)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def set_episode_start(self, unix_timestamp):
         """Set the episode start time for step calculations."""
-        self.episode_start = unix_timestamp
+        if isinstance(unix_timestamp, str):
+            unix_timestamp = self._parse_deadline_str(unix_timestamp)
+        self.episode_start = float(unix_timestamp) if unix_timestamp else 0.0
 
     def collect_all_deadlines(self, data: dict) -> List[float]:
         """Collect all deadline timestamps from the telemetry data."""
@@ -250,8 +293,11 @@ class TelemetryMapper:
         for sat in controller.get("satellites", []):
             for task in sat.get("assigned_tasks", []):
                 dl = task.get("Deadline") or task.get("deadline")
-                if dl and isinstance(dl, (int, float)) and dl > 0:
-                    deadlines.append(float(dl))
+                if dl:
+                    if isinstance(dl, str):
+                        dl = self._parse_deadline_str(dl)
+                    if isinstance(dl, (int, float)) and dl > 0:
+                        deadlines.append(float(dl))
         
         # From gossiper's unassignedTasks
         gossiper = data.get("telemetry-bridge", {}).get("gossiper", {})
@@ -259,8 +305,11 @@ class TelemetryMapper:
             if isinstance(gdata, dict):
                 for task in gdata.get("unassignedTasks", []):
                     dl = task.get("Deadline") or task.get("deadline")
-                    if dl and isinstance(dl, (int, float)) and dl > 0:
-                        deadlines.append(float(dl))
+                    if dl:
+                        if isinstance(dl, str):
+                            dl = self._parse_deadline_str(dl)
+                        if isinstance(dl, (int, float)) and dl > 0:
+                            deadlines.append(float(dl))
         
         return deadlines
 
@@ -499,7 +548,10 @@ class TelemetryMapper:
         window_type = "NONE"
         
         if deadline:
-            deadline_diff = deadline - self.episode_start
+            # Convert string deadlines to unix timestamp
+            if isinstance(deadline, str):
+                deadline = self._parse_deadline_str(deadline)
+            deadline_diff = float(deadline) - float(self.episode_start)
             
             if deadline_diff < 0:
                 # Past deadline - treat as soft/no window (already "expired" in real world)

@@ -54,7 +54,7 @@ class ManagerPolicy(nn.Module):
         )
         
         # Encode all flower states with attention
-        flower_input_dim = 12  # Same as worker observation
+        flower_input_dim = 14  # Same as worker observation
         self.flower_embed_dim = 64
         self.flower_encoder = nn.Sequential(
             nn.Linear(flower_input_dim, self.flower_embed_dim),
@@ -108,14 +108,14 @@ class ManagerPolicy(nn.Module):
         Args:
             global_obs: dict with:
                 - bee_states: (B, num_bees, bee_input_dim) - all bee states
-                - flowers: (B, num_flowers, 12) - all flower features
+                - flowers: (B, num_flowers, 14) - all flower features
                 - context: (B, 3) - global context [step_norm, harvest_ratio, active_ratio]
         
         Returns:
             goal_logits: (B, num_bees, NUM_GOALS) - goal logits per bee
         """
         bee_states = global_obs["bee_states"]  # (B, num_bees, 8)
-        flowers = global_obs["flowers"]  # (B, num_flowers, 12)
+        flowers = global_obs["flowers"]  # (B, num_flowers, 14)
         context = global_obs["context"]  # (B, 3)
         
         B = bee_states.shape[0]
@@ -214,7 +214,7 @@ class GoalConditionedWorker(nn.Module):
         # --- Flower Encoder with Attention ---
         self.flower_embed_dim = 128
         self.flowers_fc = nn.Sequential(
-            nn.Linear(12, self.flower_embed_dim),
+            nn.Linear(14, self.flower_embed_dim),
             nn.LayerNorm(self.flower_embed_dim),
             nn.ReLU(),
         )
@@ -259,6 +259,19 @@ class GoalConditionedWorker(nn.Module):
         if retask_board_size > 0:
             self.claim_head = nn.Linear(hidden_dim, retask_board_size + 1)
         
+        # --- Multi-Criteria Flower Target Scorer ---
+        # Same architecture as flat Actor: attended_flower + trunk + 6 domain criteria
+        target_input_dim = self.flower_embed_dim + hidden_dim + 6
+        self.target_scorer = nn.Sequential(
+            nn.Linear(target_input_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 1),  # scalar score per flower
+        )
+        
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
@@ -267,14 +280,16 @@ class GoalConditionedWorker(nn.Module):
             if module.bias is not None:
                 torch.nn.init.constant_(module.bias, 0.0)
     
-    def forward(self, obs_dict: dict, goal: torch.Tensor, return_claims: bool = False):
+    def forward(self, obs_dict: dict, goal: torch.Tensor, return_claims: bool = False, return_targets: bool = False):
         """
         Args:
             obs_dict: Observation dict (same as original Actor)
             goal: (B,) goal index or (B, num_goals) one-hot encoding
+            return_targets: If True, also return per-flower target logits
         
         Returns:
             action_logits: (B, action_dim)
+            target_logits: (B, num_flowers) — only if return_targets=True
         """
         def ensure2d(x: torch.Tensor) -> torch.Tensor:
             x = x if x.dim() == 2 else x.view(1, -1)
@@ -289,7 +304,7 @@ class GoalConditionedWorker(nn.Module):
         flowers = ensure2d(obs_dict["flowers"])
         B = flowers.shape[0]
         
-        flowers_reshaped = flowers.view(B, self.num_flowers, 12)
+        flowers_reshaped = flowers.view(B, self.num_flowers, 14)
         flowers_reshaped[:, :, 0] /= self.grid_size
         flowers_reshaped[:, :, 1] /= self.grid_size
         flowers_reshaped[:, :, 2] /= 10.0
@@ -343,6 +358,41 @@ class GoalConditionedWorker(nn.Module):
         h = self.trunk(h)
         action_logits = self.policy_head(h)
         
+        # --- Flower Target Logits (Multi-Criteria Scorer) ---
+        target_logits = None
+        if return_targets:
+            # Extract 6 explicit scoring criteria from raw flower features:
+            dist_score = 1.0 - flowers_reshaped[:, :, 8].clamp(0, 2)    # closer → higher
+            pollen_score = flowers_reshaped[:, :, 2]                     # higher pollen → more valuable
+            priority_score = flowers_reshaped[:, :, 12]                  # higher priority → more important
+            deadline_score = flowers_reshaped[:, :, 13]                  # higher urgency → harvest sooner
+            hard_window = flowers_reshaped[:, :, 10]                     # HARD windows need attention
+            time_to_win = flowers_reshaped[:, :, 11]                     # smaller → window closing soon
+
+            criteria = torch.stack([
+                dist_score, pollen_score, priority_score,
+                deadline_score, hard_window, time_to_win
+            ], dim=-1)  # (B, N, 6)
+
+            trunk_expanded = h.unsqueeze(1).expand(B, self.num_flowers, -1)  # (B, N, hidden)
+            target_input = torch.cat([attended_flowers, trunk_expanded, criteria], dim=-1)
+            target_logits = self.target_scorer(target_input).squeeze(-1)  # (B, N)
+
+            # Mask invalid flowers
+            harvestable_mask = (
+                (flowers_reshaped[:, :, 3] < 0.5)   # not harvested
+                & (flowers_reshaped[:, :, 6] > 0.5)  # reachable
+                & (flowers_reshaped[:, :, 7] > 0.5)  # fits capacity
+                & (flowers_reshaped[:, :, 9] > 0.5)  # in time window
+            ).float()
+            target_logits = target_logits + (harvestable_mask - 1.0) * 1e8
+
+        if return_targets:
+            if return_claims and self.claim_head is not None:
+                claim_logits = self.claim_head(h)
+                return action_logits, claim_logits, target_logits
+            return action_logits, target_logits
+        
         if return_claims and self.claim_head is not None:
             claim_logits = self.claim_head(h)
             return action_logits, claim_logits
@@ -384,7 +434,7 @@ class HRLCritic(nn.Module):
         )
         self.manager_v_head = nn.Linear(hidden_dim, 1)
         
-        # Worker critic (global state + goals for all bees)
+        # Worker critic (global state + goals for all bees) → per-bee values
         worker_input = global_state_size + num_bees * num_goals
         self.worker_trunk = nn.Sequential(
             nn.Linear(worker_input, hidden_dim),
@@ -394,7 +444,7 @@ class HRLCritic(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
         )
-        self.worker_v_head = nn.Linear(hidden_dim, 1)
+        self.worker_v_head = nn.Linear(hidden_dim, num_bees)  # One value per bee
         
         self.apply(self._init_weights)
     
@@ -414,7 +464,7 @@ class HRLCritic(nn.Module):
         return self.manager_v_head(h)
     
     def forward_worker(self, global_state: torch.Tensor, goals: torch.Tensor) -> torch.Tensor:
-        """Value for worker policy given goals."""
+        """Value for worker policy given goals. Returns (B, num_bees) per-bee values."""
         if global_state.dim() == 1:
             global_state = global_state.unsqueeze(0)
         
@@ -437,7 +487,7 @@ class HRLCritic(nn.Module):
         
         combined = torch.cat([state_norm, goals_flat], dim=-1)
         h = self.worker_trunk(combined)
-        return self.worker_v_head(h)
+        return self.worker_v_head(h)  # (B, num_bees)
 
 
 # Helper functions for HRL
@@ -466,7 +516,7 @@ def build_manager_obs(env, device: str = "cpu") -> dict:
         ]
         bee_states.append(bee_state)
     
-    # Flower states: same 12 features as worker
+    # Flower states: same 14 features as worker
     flowers = []
     for f in env.flowers:
         x = (f.x + 0.5) / env.grid_size
@@ -478,7 +528,10 @@ def build_manager_obs(env, device: str = "cpu") -> dict:
         is_hard = 1.0 if f.window_type == "HARD" else 0.0
         time_to_window = f.time_until_next_window(env.steps) / max(1.0, env.max_steps)
         
-        flower_state = [x, y, pol, harvested, has_assignment, 0.0, 0.0, 0.0, 0.0, is_harvestable, is_hard, time_to_window]
+        flower_state = [x, y, pol, harvested, has_assignment, 0.0, 0.0, 0.0, 0.0, is_harvestable, is_hard, time_to_window,
+                        float(getattr(f, 'priority', 0.0)),
+                        # deadline urgency
+                        max(0.0, min(1.0, 1.0 - (max(0, getattr(f, 'deadline_step', env.max_steps) - env.steps) / max(1, env.max_steps - env.steps)))) if getattr(f, 'deadline_step', None) is not None and not f.harvested else 0.0]
         flowers.append(flower_state)
     
     # Context
